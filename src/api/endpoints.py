@@ -3,18 +3,27 @@ FastAPI endpoint for ending an interaction.
 
 POST /session/{session_id}/interaction/{interaction_id}/end
 
-This is the entry point for all post-call processing. When a call ends,
-the telephony provider (Exotel) calls this endpoint, which:
-1. Updates the interaction status to ENDED
-2. Kicks off background processing via FastAPI BackgroundTask + Celery
+Called by Exotel (telephony provider) when a call disconnects. This webhook
+must respond fast — Exotel has a 5-second timeout and will retry if we don't.
 
-KNOWN ISSUES:
-- Uses both FastAPI BackgroundTask AND Celery — two layers of async with
-  no coordination between them
-- asyncio.create_task for signal jobs and lead stage runs in the FastAPI
-  event loop — if the server restarts, these are lost
-- No short-circuit for short transcripts at the Celery level (they still
-  get enqueued and wait for their turn)
+Current design: respond immediately, hand off to Celery for the heavy work.
+That part is fine. The problems are in what happens next.
+
+A few things to notice as you read this file:
+
+1. We check transcript length here (< 4 turns = "short"). Short calls skip
+   the LLM entirely. That's the right idea. But the check only lives here —
+   the Celery task doesn't know about it, so if a task gets requeued after
+   a crash, it will re-run without the short-transcript gate.
+
+2. For long transcripts, signal_jobs and lead_stage fire from asyncio.create_task
+   BEFORE Celery has run the LLM. The analysis_result passed to signal_jobs
+   is literally an empty dict {}. Downstream systems receive an empty payload
+   and silently do nothing useful.
+
+3. There is no correlation ID threaded through this endpoint. If something
+   fails downstream, you know the interaction_id but not which step failed,
+   when, or why.
 """
 
 import asyncio
@@ -23,7 +32,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 from src.services.signal_jobs import trigger_signal_jobs, update_lead_stage
@@ -37,6 +46,9 @@ class InteractionEndRequest(BaseModel):
     call_sid: Optional[str] = None
     duration_seconds: Optional[int] = None
     call_status: Optional[str] = None
+    # Arbitrary metadata from the telephony provider / dialler.
+    # In practice contains things like: dialler_campaign_id, lead_phone,
+    # call_attempt_number, agent_script_id. Passed through to the LLM prompt.
     additional_data: Optional[Dict[str, Any]] = None
 
 
@@ -61,20 +73,18 @@ async def end_interaction(
 
     Current flow:
     1. Load interaction from DB
-    2. Update status to ENDED
-    3. Check if transcript is short
-       - Short: just update status, fire signal jobs (asyncio.create_task)
-       - Long: enqueue full processing to Celery
-    4. Return 200 immediately
+    2. Mark status ENDED
+    3. Decide short vs long transcript
+       - Short (< 4 turns): fire signal jobs inline, skip LLM
+       - Long: dump everything into Celery, fire signal jobs anyway (empty payload)
+    4. Return 200 before anything actually processes
     """
     try:
-        # Mock: In production, this loads from DB
         interaction = await _load_interaction(interaction_id)
 
         if not interaction:
             raise HTTPException(status_code=404, detail="Interaction not found")
 
-        # Update status
         await _update_interaction_status(
             interaction_id=str(interaction_id),
             status="ENDED",
@@ -83,18 +93,21 @@ async def end_interaction(
             call_sid=request.call_sid,
         )
 
-        # Check transcript length
         transcript = interaction.get("conversation_data", {}).get("transcript", [])
         is_short = len(transcript) < 4
 
         if is_short:
-            # Short transcript: minimal processing, no LLM
+            # Fewer than 4 turns: wrong number, immediate hangup, network drop.
+            # Skip LLM — there's nothing meaningful to extract.
+            # Signal jobs still fire so the lead stage gets updated.
             logger.info(
                 "short_transcript_fast_path",
                 extra={"interaction_id": str(interaction_id)},
             )
 
-            # BUG: These run in the FastAPI event loop — lost on server restart
+            # These asyncio.create_tasks share the FastAPI event loop.
+            # If the server restarts between the 200 response and these
+            # completing, they vanish with no trace. No retry, no record.
             asyncio.create_task(
                 trigger_signal_jobs(
                     interaction_id=str(interaction_id),
@@ -110,9 +123,12 @@ async def end_interaction(
                     call_stage="short_call",
                 )
             )
+
         else:
-            # Long transcript: full processing via Celery
-            # Every call gets the same priority, same queue, same processing
+            # Long transcript: pack everything into a Celery payload and enqueue.
+            # All calls get the same queue, same priority, same processing path —
+            # regardless of whether the call resulted in a confirmed booking or
+            # a customer hanging up after one sentence.
             transcript_text = "\n".join(
                 f"{turn.get('role', 'unknown')}: {turn.get('content', '')}"
                 for turn in transcript
@@ -133,10 +149,9 @@ async def end_interaction(
                 "exotel_account_id": interaction.get("exotel_account_id"),
             }
 
-            # Enqueue to single Celery queue — no priority, no filtering
             task = process_interaction_end_background_task.apply_async(
                 args=[celery_payload],
-                queue="postcall_processing",
+                queue="postcall_processing",  # One queue to rule them all
             )
 
             logger.info(
@@ -144,24 +159,28 @@ async def end_interaction(
                 extra={
                     "interaction_id": str(interaction_id),
                     "celery_task_id": task.id,
+                    # Notice what's NOT logged here: no queue depth, no estimated
+                    # wait time, no indication of how backed up we are.
                 },
             )
 
-            # BUG: Also fire signal jobs and lead stage from FastAPI event loop
-            # These run BEFORE the Celery task completes analysis
+            # These fire immediately — before Celery has done anything.
+            # analysis_result={} means downstream gets an empty analysis.
+            # This was supposed to be a "best effort early trigger" but it
+            # mostly just sends empty payloads to signal_jobs.
             asyncio.create_task(
                 trigger_signal_jobs(
                     interaction_id=str(interaction_id),
                     session_id=str(session_id),
                     campaign_id=interaction["campaign_id"],
-                    analysis_result={},
+                    analysis_result={},  # ← Celery hasn't run yet. This is empty.
                 )
             )
             asyncio.create_task(
                 update_lead_stage(
                     lead_id=interaction["lead_id"],
                     interaction_id=str(interaction_id),
-                    call_stage="processing",
+                    call_stage="processing",  # ← Placeholder, not a real outcome
                 )
             )
 
@@ -182,8 +201,18 @@ async def end_interaction(
 
 
 async def _load_interaction(interaction_id: UUID) -> Optional[Dict[str, Any]]:
-    """Mock: Load interaction from database."""
-    # In production, this queries the interactions table
+    """
+    Load interaction from the database.
+
+    In production: SELECT * FROM interactions WHERE id = $1.
+    The conversation_data JSONB column holds the full transcript as:
+        {"transcript": [{"role": "agent"|"customer", "content": "..."}]}
+
+    The interaction_metadata column is the dashboard's hot cache —
+    the UI reads from here, not from a separate analysis table.
+    Worth thinking about whether that's the right separation of concerns.
+    """
+    # Mock — returns a realistic sample for local development
     return {
         "id": str(interaction_id),
         "lead_id": "mock-lead-id",
@@ -213,7 +242,14 @@ async def _update_interaction_status(
     duration: Optional[int],
     call_sid: Optional[str],
 ) -> None:
-    """Mock: Update interaction status in database."""
+    """
+    Update interaction status in the database.
+
+    In production:
+        UPDATE interactions
+        SET status = $2, ended_at = $3, duration_seconds = $4, call_sid = $5
+        WHERE id = $1
+    """
     logger.info(
         "interaction_status_updated",
         extra={

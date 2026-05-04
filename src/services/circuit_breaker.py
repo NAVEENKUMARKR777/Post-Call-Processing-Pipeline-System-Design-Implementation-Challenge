@@ -1,19 +1,42 @@
 """
-PostCallCircuitBreaker — Controls dialler behaviour based on post-call LLM load.
+PostCallCircuitBreaker — Tries to protect the LLM API from overload.
 
-KNOWN ISSUE: When post-call analysis backs up (e.g., Celery queue depth > 1000),
-the circuit breaker trips and freezes the dialler for the affected agent_id for
-1800 seconds. This means a post-call backlog directly stops new outbound calls —
-a cascading failure with no visibility or recovery mechanism.
+The idea was sound: if we're sending too many LLM requests, slow down new
+calls before the provider starts returning 429s. The execution is too blunt.
 
-The dialler team has no way to distinguish "LLM quota genuinely exhausted" from
-"Celery queue backed up because of a transient Redis hiccup".
+Current behaviour:
+  - Checks RPM usage against LLM_REQUESTS_PER_MINUTE
+  - If usage >= 90%: freeze the dialler for the agent for 1800 seconds
+  - The dialler checks this before dispatching new calls
+
+Problems:
+  1. Binary response. 89% capacity: full speed. 90%: complete stop for 30 minutes.
+     There's no middle gear — no "slow down a bit", no "pause for 5 seconds".
+
+  2. Wrong granularity. Freezes at agent_id level. If one campaign is consuming
+     all the LLM quota, every agent — across all customers — hits the freeze.
+
+  3. Measuring the wrong thing. This tracks in-flight Celery tasks via an RPM
+     counter. But LLM providers rate-limit on tokens/minute, not requests/minute.
+     A 10-turn conversation uses 3× the tokens of a 3-turn one. The circuit
+     breaker doesn't know that.
+
+  4. The counter is written by record_postcall_start(), which is called after
+     deciding to fire the LLM request — not before. By the time the breaker
+     could trip, the requests are already in flight.
+
+  5. No visibility. The dialler just sees "circuit open". It doesn't know if it's
+     because of a genuine quota issue or a transient Redis blip that made the
+     counter stale.
+
+Consider: what would a system look like where the dialler doesn't freeze at all,
+but instead naturally dispatches fewer calls when LLM capacity is constrained?
+The capacity signal already exists — it just needs to be used differently.
 """
 
-import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 from src.config import settings
@@ -29,20 +52,20 @@ class CircuitState:
     opened_at: Optional[float] = None
     freeze_until: Optional[float] = None
     consecutive_failures: int = 0
+    # consecutive_failures is tracked but never used in trip logic.
+    # It was intended for a half-open state that never got implemented.
 
 
 class PostCallCircuitBreaker:
     """
-    Monitors LLM capacity usage for post-call processing.
-    When usage >= 90% of capacity, trips the circuit breaker for the agent,
-    freezing all outbound dials for that agent for 1800 seconds.
+    Checks whether the dialler should be allowed to make a new call.
+    Called by the dialler before dispatching each outbound call.
 
-    Problems:
-    - No gradual backpressure — it's binary (open/closed)
-    - Freeze duration is hardcoded (1800s)
-    - Agent-level granularity is too coarse (one bad campaign freezes all)
-    - No visibility — the dialler just sees "circuit open" with no context
-    - Capacity is measured by in-flight Celery tasks, not actual LLM quota usage
+    The Redis key `llm:postcall:rpm` is the shared state between this
+    circuit breaker and the post-call workers. Workers increment it when
+    they start an LLM request. The TTL of 60 seconds means it naturally
+    decays — but if workers crash mid-request, they may not decrement it,
+    causing the counter to be permanently inflated until TTL expires.
     """
 
     def __init__(self):
@@ -51,7 +74,12 @@ class PostCallCircuitBreaker:
         self._freeze_seconds = settings.CIRCUIT_BREAKER_FREEZE_SECONDS
 
     async def check_capacity(self, agent_id: str) -> bool:
-        """Returns True if the agent is allowed to make new calls."""
+        """
+        Returns True if the agent is allowed to make a new call.
+
+        Called by the dialler. NOT called by the post-call workers —
+        they fire LLM requests unconditionally.
+        """
         state = self._states.get(agent_id)
 
         if state and state.is_open:
@@ -60,19 +88,22 @@ class PostCallCircuitBreaker:
                     "circuit_breaker_open",
                     extra={
                         "agent_id": agent_id,
-                        "freeze_remaining_s": state.freeze_until - time.time(),
+                        "freeze_remaining_s": round(state.freeze_until - time.time()),
                     },
                 )
                 return False
-            # Freeze expired — close the circuit
+            # Freeze expired — reset without checking whether the underlying
+            # cause (LLM overload) has actually resolved.
             state.is_open = False
             state.consecutive_failures = 0
             logger.info("circuit_breaker_closed", extra={"agent_id": agent_id})
 
-        # Check current LLM capacity via Redis counters
-        current_rpm = int(await redis_client.get(f"llm:postcall:rpm") or 0)
+        current_rpm = int(await redis_client.get("llm:postcall:rpm") or 0)
         max_rpm = settings.LLM_REQUESTS_PER_MINUTE
 
+        # This is requests-per-minute, not tokens-per-minute.
+        # A campaign with long transcripts will hit the token limit first,
+        # but this check won't see it until RPM also spikes.
         usage_ratio = current_rpm / max_rpm if max_rpm > 0 else 0
 
         if usage_ratio >= self._capacity_threshold:
@@ -82,6 +113,13 @@ class PostCallCircuitBreaker:
         return True
 
     def _trip(self, agent_id: str):
+        """
+        Open the circuit breaker for agent_id for CIRCUIT_BREAKER_FREEZE_SECONDS.
+
+        Logs an error but provides no context about WHY it tripped — the on-call
+        engineer sees "circuit_breaker_tripped" and has to go dig in Redis to
+        figure out whether it was LLM quota, a Celery backlog, or a Redis glitch.
+        """
         now = time.time()
         state = CircuitState(
             agent_id=agent_id,
@@ -97,16 +135,32 @@ class PostCallCircuitBreaker:
                 "agent_id": agent_id,
                 "freeze_seconds": self._freeze_seconds,
                 "capacity_threshold": self._capacity_threshold,
+                # Would be useful to also log: current_rpm, current_tpm,
+                # queue_depth, and which customer's calls triggered the spike.
+                # None of that is available here.
             },
         )
 
     async def record_postcall_start(self):
-        """Increment in-flight counter when a post-call LLM request starts."""
+        """
+        Increment the RPM counter when a post-call LLM request starts.
+
+        This runs AFTER we've decided to fire the request, so it's a
+        measurement, not a gate. The dialler reads this counter to make
+        dispatch decisions — there's a lag between when requests go out
+        and when the counter updates.
+        """
         await redis_client.incr("llm:postcall:rpm")
         await redis_client.expire("llm:postcall:rpm", 60)
 
     async def record_postcall_end(self):
-        """Decrement in-flight counter when a post-call LLM request completes."""
+        """
+        Decrement the RPM counter when the LLM request completes.
+
+        If the worker crashes between start and end, the counter stays
+        inflated until the 60-second TTL expires. During that window,
+        the circuit breaker may trip unnecessarily.
+        """
         await redis_client.decr("llm:postcall:rpm")
 
 

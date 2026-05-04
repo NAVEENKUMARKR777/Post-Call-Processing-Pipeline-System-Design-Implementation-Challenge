@@ -1,14 +1,24 @@
 """
-PostCallProcessor — Runs full LLM analysis on every completed interaction.
+PostCallProcessor — Runs LLM analysis on a completed call transcript.
 
-KNOWN ISSUE: This processor runs on 100% of calls with identical priority.
-A call where the lead confirmed a rebook gets the same treatment as a call
-where the lead said "not interested" and hung up in 10 seconds. At 100K calls
-per campaign, this creates a massive backlog where high-value calls are delayed
-by hours behind thousands of non-actionable ones.
+This is where the LLM quota gets spent. Every call that reaches this class
+consumes ~1,500 tokens on average (see settings.LLM_AVG_TOKENS_PER_CALL).
 
-There is no triage, no prioritisation, and no way to distinguish actionable
-outcomes before committing full LLM cost.
+The prompt extracts three things in a single LLM call (single_prompt=True):
+  - call_stage: the outcome/disposition ("rebook_confirmed", "not_interested", etc.)
+  - entities: structured data mentioned in the call (dates, amounts, names)
+  - summary: a human-readable summary for the dashboard
+
+One design observation: call_stage is usually detectable with high confidence
+from just a few sentences of the transcript — sometimes from a single phrase.
+Full entity extraction and summarisation are only useful if the call had a
+meaningful outcome. Whether that distinction is worth acting on is a question
+worth thinking about.
+
+Another observation: the LLM response includes a `usage` field with the exact
+token count. We log it per call. We don't aggregate it anywhere. We can't
+currently answer "how many tokens did Customer X use this hour?" without
+scanning logs.
 """
 
 import json
@@ -25,27 +35,28 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PostCallContext:
+    """Everything needed to process one completed call."""
     interaction_id: str
     session_id: str
     lead_id: str
     campaign_id: str
-    customer_id: str
+    customer_id: str  # The business using the platform (not the person called)
     agent_id: str
-    call_sid: str
+    call_sid: str     # Exotel's identifier for the call
     transcript_text: str
     conversation_data: dict
-    additional_data: dict
+    additional_data: dict  # Arbitrary metadata from the dialler (campaign config, etc.)
     ended_at: datetime
     exotel_account_id: Optional[str] = None
 
 
 @dataclass
 class AnalysisResult:
-    call_stage: str
-    entities: Dict[str, Any]
-    summary: str
+    call_stage: str          # Disposition: rebook_confirmed, not_interested, etc.
+    entities: Dict[str, Any] # Structured entities extracted from the transcript
+    summary: str             # Human-readable summary for dashboard display
     raw_response: Dict[str, Any]
-    tokens_used: int
+    tokens_used: int         # Actual tokens consumed — source of truth for billing
     latency_ms: float
     provider: str
     model: str
@@ -53,27 +64,37 @@ class AnalysisResult:
 
 class PostCallProcessor:
     """
-    Processes every interaction through full LLM analysis.
+    Runs full LLM analysis on a transcript.
 
-    Problems:
-    1. No filtering — every call gets full LLM analysis regardless of outcome
-    2. Single priority queue — rebook confirmations wait behind "not interested" calls
-    3. Full streaming API cost on every call — no batch API option
-    4. Tightly coupled to circuit breaker — backlog triggers dialler freeze
-    5. No per-customer configuration — same prompt/model for everyone
+    Currently called for every interaction that isn't a short call.
+    No pre-screening, no quota check before firing, no customer-level budgeting.
+
+    The circuit_breaker.record_postcall_start() call increments a Redis counter
+    used by the dialler's capacity check. But it tracks in-flight tasks, not
+    actual tokens/minute. By the time the circuit breaker trips (at 90% RPM),
+    we've already been 429-ing for a while.
     """
 
     async def process_post_call(
         self, ctx: PostCallContext, single_prompt: bool = True
     ) -> AnalysisResult:
         """
-        Run full LLM analysis on the interaction transcript.
+        Run LLM analysis and write result to interaction_metadata.
 
-        This is called for EVERY completed interaction, regardless of whether
-        the call produced an actionable outcome.
+        single_prompt=True means we run entity extraction, classification, and
+        summarisation in one LLM call. This was a cost optimisation over an
+        earlier version that made three separate calls. It's the right trade-off.
+
+        What this function does NOT do before calling the LLM:
+          - Check whether we're near the tokens/minute limit
+          - Check whether this customer has exceeded their allocated budget
+          - Consider whether this call's outcome even warrants full analysis
         """
 
-        # Track LLM usage for circuit breaker
+        # Tells the circuit breaker an LLM request is in flight.
+        # Note: this increments llm:postcall:rpm but doesn't check it first.
+        # The check happens in circuit_breaker.check_capacity(), which is
+        # called by the dialler — not here, before spending the tokens.
         await circuit_breaker.record_postcall_start()
 
         try:
@@ -83,23 +104,28 @@ class PostCallProcessor:
                 single_prompt,
             )
 
-            # Call LLM API (streaming, full cost)
             start_time = datetime.utcnow()
             response = await self._call_llm(prompt)
             elapsed_ms = (datetime.utcnow() - start_time).total_seconds() * 1000
 
             result = self._parse_response(response, elapsed_ms)
 
-            # Write result directly to interaction_metadata
+            # Result written to interaction_metadata — the dashboard's hot cache.
+            # There is no separate "analysis results" table. The JSONB column on
+            # the interactions row is the only place this data lives.
             await self._update_interaction_metadata(ctx.interaction_id, result)
 
             logger.info(
                 "postcall_analysis_complete",
                 extra={
                     "interaction_id": ctx.interaction_id,
+                    "customer_id": ctx.customer_id,
+                    "campaign_id": ctx.campaign_id,
                     "call_stage": result.call_stage,
                     "tokens_used": result.tokens_used,
                     "latency_ms": result.latency_ms,
+                    # tokens_used is logged here but never written back to any
+                    # counter that could enforce a per-customer budget.
                 },
             )
 
@@ -111,6 +137,10 @@ class PostCallProcessor:
                 extra={
                     "interaction_id": ctx.interaction_id,
                     "error": str(e),
+                    # If this is a 429 from the LLM provider, the error message
+                    # will say so. But the retry logic above doesn't distinguish
+                    # "retry in 1 second" (rate limit) from "retry in 60 seconds"
+                    # (transient failure) — it always waits 60 seconds.
                 },
             )
             raise
@@ -125,8 +155,14 @@ class PostCallProcessor:
         single_prompt: bool,
     ) -> str:
         """
-        Build the LLM prompt for post-call analysis.
-        Uses a single combined prompt (entity extraction + classification + summary).
+        Build the LLM prompt.
+
+        The system prompt asks for three outputs in one JSON object.
+        call_stage is the most important — everything downstream depends on it.
+        entities and summary are useful but secondary.
+
+        If you were thinking about a cheaper "just classify the call_stage" step
+        before the full analysis, this is the prompt you'd be splitting.
         """
         system_prompt = """You are a call analysis assistant. Analyze the following
 call transcript and extract:
@@ -141,14 +177,27 @@ Respond in JSON format:
     "summary": "..."
 }"""
 
-        return f"{system_prompt}\n\nTranscript:\n{transcript}\n\nAdditional context:\n{json.dumps(additional_data)}"
+        return (
+            f"{system_prompt}\n\n"
+            f"Transcript:\n{transcript}\n\n"
+            f"Additional context:\n{json.dumps(additional_data)}"
+        )
 
     async def _call_llm(self, prompt: str) -> dict:
         """
-        Call the LLM API. In production, this uses the configured provider.
-        Mock implementation for assessment.
+        Call the configured LLM provider.
+
+        In production this is an httpx POST to the provider's API.
+        A 429 response raises an exception that propagates up to the Celery
+        retry handler — which retries after a fixed 60-second delay regardless
+        of the Retry-After header the provider sends back.
+
+        Mock implementation for the assessment.
         """
-        # Mock: In production, this calls OpenAI/Gemini/etc via httpx
+        # The provider's response includes a `usage` block:
+        # {"prompt_tokens": N, "completion_tokens": M, "total_tokens": N+M}
+        # We surface total_tokens in AnalysisResult but don't write it back
+        # anywhere that could be used for budget tracking or alerting.
         return {
             "call_stage": "unknown",
             "entities": {},
@@ -172,10 +221,18 @@ Respond in JSON format:
         self, interaction_id: str, result: AnalysisResult
     ) -> None:
         """
-        Write analysis results to interaction_metadata JSONB column.
-        This is the hot cache the dashboard reads.
+        Write analysis results into the interaction_metadata JSONB column.
+
+        In production:
+            UPDATE interactions
+            SET interaction_metadata = interaction_metadata || $2::jsonb,
+                updated_at = NOW()
+            WHERE id = $1
+
+        The dashboard reads interaction_metadata directly. There is no separate
+        results table — this JSONB column is the only record of the analysis.
+        If it gets overwritten by a retry, the previous result is gone.
         """
-        # Mock: In production, this runs an UPDATE query
         logger.info(
             "metadata_updated",
             extra={

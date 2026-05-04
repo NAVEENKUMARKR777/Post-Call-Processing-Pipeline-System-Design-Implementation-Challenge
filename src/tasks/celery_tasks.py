@@ -2,18 +2,35 @@
 Celery tasks for post-call processing.
 
 This is the main background processing pipeline. Every completed interaction
-is enqueued here for full LLM analysis, recording upload, signal jobs, and
-lead stage updates.
+with a long transcript ends up here.
 
-KNOWN ISSUES:
-- Single queue, no priority: A rebook confirmation waits behind 10,000
-  "not interested" calls in the same Celery queue.
-- Tasks drop silently: If Redis (the Celery broker) restarts, in-flight
-  tasks are lost with no recovery mechanism.
-- No workflow visibility: There is no way to see which step of processing
-  a given interaction is currently in.
-- Full LLM cost on every call: No filtering or triage before running
-  expensive LLM analysis.
+The task runs five steps sequentially:
+    1. Wait 45s, try to fetch recording from Exotel → upload to S3
+    2. Run full LLM analysis on the transcript
+    3. Write result to interaction_metadata (dashboard cache)
+    4. Trigger signal jobs (downstream actions: WhatsApp, callbacks, etc.)
+    5. Update lead stage
+
+A few things worth understanding before you start changing things:
+
+WHY CELERY + REDIS?
+  We needed a task queue and Celery was already in the stack. Redis was already
+  in the stack. It worked fine at 1K calls/day. At 100K calls/campaign the cracks
+  show: broker restarts lose tasks, queue depth is invisible, and there's no way
+  to see which step a given interaction is stuck on.
+
+WHY ONE QUEUE?
+  Originally there was only one customer. One queue was fine. We never revisited
+  it when the platform became multi-customer. Now a campaign for Customer A can
+  fill the queue and delay Customer B's results by hours.
+
+WHY DOES RECORDING BLOCK ANALYSIS?
+  It shouldn't. Recording upload and LLM analysis are completely independent —
+  the LLM reads the transcript, not the audio file. But they're sequential here
+  because that's how the task was originally written and nobody had a reason to
+  split them until the 45-second sleep became a visible SLA problem.
+
+  Think about what "run them in parallel" would require at the infrastructure level.
 """
 
 import asyncio
@@ -35,24 +52,26 @@ logger = logging.getLogger(__name__)
     name="process_interaction_end_background_task",
     bind=True,
     max_retries=3,
-    default_retry_delay=60,
-    acks_late=True,
+    default_retry_delay=60,  # Fixed 60s — no exponential backoff
+    acks_late=True,           # Task only acked after completion, not on receipt.
+                              # This means a worker crash causes redelivery — good.
+                              # But "redelivery" goes to the back of the queue,
+                              # which at 100K depth means hours of extra wait.
     queue="postcall_processing",
 )
 def process_interaction_end_background_task(self, payload: Dict[str, Any]):
     """
-    Main Celery task for post-call processing.
-    Called for EVERY completed interaction — no filtering.
+    Main Celery task. Called for every long-transcript interaction.
 
-    Steps:
-    1. Wait 45s for recording, then try to fetch + upload (single attempt)
-    2. Run full LLM analysis on the transcript (streaming API, full cost)
-    3. Update interaction metadata (dashboard hot cache)
-    4. Trigger signal jobs (fire-and-forget)
-    5. Update lead stage
+    Celery workers are synchronous by default, so we spin up an event loop
+    per task to run the async processing code. This means each Celery worker
+    process handles one interaction at a time — no concurrency within a worker.
 
-    All steps run sequentially. If step 2 fails, steps 3-5 are skipped.
-    Recording upload (step 1) is independent but blocks step 2 by 45 seconds.
+    At 100K interactions/campaign with ~3,500ms LLM latency per call:
+        100,000 × 3.5s = 350,000 worker-seconds needed
+        With 10 workers: ~9.7 hours to drain the queue
+
+    If your campaign window is 8 hours, you're already behind before you start.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -68,7 +87,9 @@ def process_interaction_end_background_task(self, payload: Dict[str, Any]):
                 "attempt": self.request.retries,
             },
         )
-        # Enqueue to retry queue — which itself is Redis-based and not durable
+        # Failed tasks go into PostCallRetryQueue (Redis) AND Celery retries.
+        # Two retry mechanisms that don't know about each other. An interaction
+        # can end up being processed twice if both fire.
         loop.run_until_complete(
             retry_queue.enqueue_retry(
                 interaction_id=payload["interaction_id"],
@@ -101,7 +122,13 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         exotel_account_id=payload.get("exotel_account_id"),
     )
 
-    # Step 1: Recording upload (blocks for 45 seconds regardless)
+    # ── Step 1: Recording ─────────────────────────────────────────────────────
+    # Blocks here for ~45 seconds waiting for Exotel to make the recording
+    # available. The LLM analysis (step 2) cannot start until this completes,
+    # even though it has zero dependency on the recording.
+    #
+    # Under load, recordings often arrive in 10–15s. We wait 45s anyway.
+    # Sometimes they arrive after 60s. We've already given up by then.
     recording_s3_key = await fetch_and_upload_recording(
         interaction_id=ctx.interaction_id,
         call_sid=ctx.call_sid,
@@ -111,13 +138,20 @@ async def _process_interaction(task, payload: Dict[str, Any]):
     if recording_s3_key:
         logger.info(
             "recording_uploaded",
-            extra={
-                "interaction_id": interaction_id,
-                "s3_key": recording_s3_key,
-            },
+            extra={"interaction_id": interaction_id, "s3_key": recording_s3_key},
         )
+    # If recording_s3_key is None, we continue silently. No alert, no retry,
+    # no flag on the interaction. The recording is just gone.
 
-    # Step 2: Full LLM analysis (same cost whether call was 10s or 10min)
+    # ── Step 2: LLM analysis ──────────────────────────────────────────────────
+    # Full analysis on every call. 1,500 tokens average. No pre-screening.
+    # A call where the customer said "wrong number" after one sentence gets the
+    # same treatment as a confirmed rebook.
+    #
+    # The LLM rate limit (settings.LLM_TOKENS_PER_MINUTE) is not checked before
+    # this call. If we're over the limit, the provider returns a 429 and this
+    # raises an exception, which triggers Celery retry — which goes to the back
+    # of the 100K-item queue and makes the problem worse.
     processor = PostCallProcessor()
     result = await processor.process_post_call(ctx, single_prompt=True)
 
@@ -125,7 +159,12 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         interaction_id, result.tokens_used, result.latency_ms
     )
 
-    # Step 3: Signal jobs (fire-and-forget, no retry if it fails)
+    # ── Step 3: Signal jobs ───────────────────────────────────────────────────
+    # Downstream actions: send a WhatsApp follow-up, book a callback slot,
+    # push to the customer's CRM. These depend on knowing the analysis result.
+    #
+    # If this raises, we log a warning and continue — the lead stage still
+    # updates. But the downstream action (WhatsApp, callback, CRM push) is lost.
     try:
         await trigger_signal_jobs(
             interaction_id=ctx.interaction_id,
@@ -136,7 +175,10 @@ async def _process_interaction(task, payload: Dict[str, Any]):
     except Exception as e:
         logger.warning("signal_jobs_failed", extra={"error": str(e)})
 
-    # Step 4: Lead stage update
+    # ── Step 4: Lead stage update ─────────────────────────────────────────────
+    # Updates the lead's stage in the leads table based on call_stage.
+    # e.g., "rebook_confirmed" → lead moves to "booked" stage.
+    # Same fire-and-forget risk as signal_jobs above.
     try:
         await update_lead_stage(
             lead_id=ctx.lead_id,
