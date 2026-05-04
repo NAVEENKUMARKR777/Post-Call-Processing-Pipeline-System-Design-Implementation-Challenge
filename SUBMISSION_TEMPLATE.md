@@ -2,114 +2,131 @@
 
 **Author:** [Your Name]
 **Date:** [Date]
-**Time Spent:** [X hours]
 
 ---
 
-## 1. Architecture Overview
+## 1. Assumptions
 
-_Describe the end-to-end flow from call-end webhook to completed analysis. Include a diagram._
-
-```
-[Your architecture diagram here — ASCII or Mermaid]
-```
-
-### Key Design Decisions
-
-_List the 3-5 most important decisions and why you made them._
+_State every assumption you made about the business, system, or environment. Be specific. These will be discussed in the follow-up._
 
 1. ...
 2. ...
 
 ---
 
-## 2. Triage / Filtering Strategy
+## 2. Problem Diagnosis
 
-_How do you classify calls before full LLM analysis? What's the classification approach?_
-
-### Classification Stages
-
-_Describe each stage of your filter._
-
-### Configuration
-
-_How is the filter configured per customer? Where does config live?_
+_Before designing anything: what is actually broken, and why does it break at scale? In your own words._
 
 ---
 
-## 3. Two-Lane Processing
+## 3. Architecture Overview
 
-### Hot Lane
-
-- **Trigger:** ...
-- **Processing:** ...
-- **SLA target:** ...
-
-### Cold Lane
-
-- **Trigger:** ...
-- **Processing:** ...
-- **SLA target:** ...
-
-### Cost Model
-
-_Show the math. State your assumptions._
+_End-to-end flow from call-end webhook to completed analysis. Include a diagram._
 
 ```
-Current cost:    ...
-Proposed cost:   ...
-Savings:         ...
+[Your architecture diagram — ASCII or Mermaid]
 ```
 
----
+### Key design decisions
 
-## 4. Recording Pipeline
-
-_How does your recording poller work? What happens on failure?_
-
----
-
-## 5. Dialler Coupling
-
-_How do you replace the binary circuit breaker with gradual backpressure?_
+1. ...
+2. ...
 
 ---
 
-## 6. Data Model
+## 4. Rate Limit Management
 
-_What new tables/columns? Show the schema._
+_This is the primary problem. How does your system respect LLM rate limits across 100K calls?_
+
+### How you track rate limit usage
+
+### How you decide what to process now vs. defer
+
+### What happens when the limit is hit (recovery, not crash)
+
+---
+
+## 5. Per-Customer Token Budgeting
+
+_If total capacity is N tokens/min and K customers are active simultaneously:_
+
+- How do you allocate capacity across customers?
+- What guarantees does a customer with a pre-allocated budget receive?
+- What happens when a customer exceeds their budget?
+- What happens to unallocated headroom?
+
+---
+
+## 6. Differentiated Processing
+
+_Some call outcomes are time-sensitive. Some can wait. How do you determine which is which?_
+
+_What mechanism do you use — is it a classification step, a flag set by the business, something else? Justify your choice._
+
+---
+
+## 7. Recording Pipeline
+
+_Replacement for `asyncio.sleep(45s)`. How does it work? What does a failure look like to the on-call engineer?_
+
+---
+
+## 8. Reliability & Durability
+
+_How do you ensure no analysis result is permanently lost?_
+
+---
+
+## 9. Auditability & Observability
+
+_How would you debug a specific failed interaction 3 days after the fact?_
+
+### What you log (and what fields every log event includes)
+
+### Alert conditions
+
+---
+
+## 10. Data Model
+
+_Schema changes required. Show the SQL._
 
 ```sql
--- Your schema changes here
+-- Your schema additions/changes here
 ```
 
 ---
 
-## 7. Observability
+## 11. Security
 
-_What do you log? What do you alert on? What dashboards would you build?_
+_What data in this system is sensitive? How do you protect it at rest and in transit?_
 
 ---
 
-## 8. Trade-offs & Alternatives Considered
+## 12. API Interface
 
-_What did you consider and reject? Why?_
+_Did you change the API contract (`POST /session/.../end`)? If yes, explain why. If no, explain why you kept it._
 
-| Option | Considered | Rejected Because |
-|--------|-----------|-----------------|
+---
+
+## 13. Trade-offs & Alternatives Considered
+
+| Option | Why Considered | Why Rejected / What You Chose Instead |
+|--------|---------------|--------------------------------------|
 | ... | ... | ... |
 
 ---
 
-## 9. What I Would Do With More Time
+## 14. Known Weaknesses
 
-_What's left unfinished? What would you prioritise next?_
+_What are the gaps in your design? What would you address next?_
 
 ---
 
-## 10. Assumptions
+## 15. What I Would Do With More Time
 
-_List any assumptions you made about the system._
+_Specific, prioritised list — not a generic wishlist._
 
 1. ...
 2. ...

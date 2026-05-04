@@ -2,22 +2,22 @@
 
 ## Overview
 
-You are a backend engineer joining a **voice AI platform** that automates outbound calling campaigns for B2B customers. The platform handles ~100,000 calls per campaign run across multiple customers.
+You are a backend engineer on a voice AI platform that automates outbound calling campaigns for B2B customers. The platform handles ~100,000 calls per campaign run across multiple customers simultaneously.
 
 When a call ends, the system must:
 1. Fetch and store the call recording
 2. Analyze the conversation transcript using an LLM
-3. Extract entities, classify the call outcome (disposition), and update the dashboard
+3. Extract entities, classify the call outcome, and update the dashboard
 4. Push results to the customer's CRM (if configured)
 5. Trigger downstream actions (follow-up messages, lead stage updates)
 
-**The current implementation has critical problems at scale.** Your job is to redesign and implement the post-call processing pipeline.
+**The current implementation breaks at scale.** Your job is to identify the problems, design a better system, and implement the most critical parts.
 
 ---
 
 ## The Current System (What You're Starting With)
 
-The codebase in `src/` is a working (but flawed) implementation. Study it carefully before designing your solution.
+The codebase in `src/` is a working but flawed implementation. Spend time reading it before writing anything.
 
 ### Architecture (Current)
 
@@ -39,187 +39,205 @@ POST /session/{sid}/interaction/{iid}/end
 
 ### Key Files
 
-| File | What It Does | What's Wrong |
-|------|-------------|-------------|
-| `src/api/endpoints.py` | FastAPI endpoint — receives call-end webhook | Uses both `asyncio.create_task` and Celery with no coordination |
-| `src/tasks/celery_tasks.py` | Celery task — runs all post-call processing | Single queue, no priority, tasks drop silently on Redis restart |
-| `src/services/post_call_processor.py` | LLM analysis — runs on every call | No filtering — full LLM cost on 100% of calls regardless of outcome |
-| `src/services/recording.py` | Recording fetch + S3 upload | Hardcoded `asyncio.sleep(45s)`, single attempt, silent failure |
-| `src/services/circuit_breaker.py` | Controls dialler based on LLM load | Binary trip at 90% → freezes dialler for 1800s, no gradual backpressure |
-| `src/services/retry_queue.py` | Redis-based retry for failed tasks | No durability, no dead-letter queue, no visibility |
+| File | What It Does |
+|------|-------------|
+| `src/api/endpoints.py` | FastAPI endpoint — receives call-end webhook from telephony provider |
+| `src/tasks/celery_tasks.py` | Celery task — orchestrates all post-call processing |
+| `src/services/post_call_processor.py` | LLM analysis — runs on every completed call |
+| `src/services/recording.py` | Recording fetch + S3 upload |
+| `src/services/circuit_breaker.py` | Attempts to protect the dialler from LLM overload |
+| `src/services/retry_queue.py` | Redis-based retry for failed tasks |
+| `src/config.py` | All configuration — note the LLM rate limit settings |
 
-### Failure Modes You Must Fix
+### Known Failure Modes
 
-1. **No prioritisation.** Every call — whether it resulted in a confirmed rebook or a flat "not interested" — enters the same queue. At 100K calls, high-value calls are delayed by hours behind non-actionable ones.
+The inline comments throughout the codebase describe specific problems. The most severe ones to address:
 
-2. **Full LLM cost on every call.** ~85–90% of calls produce non-actionable outcomes (not interested, callback later, already done). Running full LLM analysis on all of them wastes quota that should be reserved for actionable calls.
+1. **`asyncio.sleep(45s)` recording gate.** The system blindly waits 45 seconds for the recording to appear. Recordings delivered after that are silently skipped — no retry, no alert, no visibility.
 
-3. **`asyncio.sleep(45s)` is a fragile recording gate.** The system blindly waits 45 seconds for the recording to appear. If recording delivery is delayed (common at high concurrency), it's silently skipped — no retry, no alert.
+2. **Tasks drop silently.** If Redis (the Celery broker) restarts, in-flight tasks are lost. The retry queue is also Redis-backed — a Redis failure means double loss. There is no durable execution or dead-letter mechanism.
 
-4. **Post-call backlog freezes the dialler.** The circuit breaker at ≥90% capacity triggers a 1800-second freeze on the dialler. A post-call analysis backlog directly stops new outbound calls — a cascading failure.
+3. **The circuit breaker is too blunt.** At ≥90% LLM capacity, it freezes ALL outbound dialling for the affected agent for 1800 seconds. A post-call backlog directly stops new calls — a cascading failure with no gradual fallback.
 
-5. **Celery + Redis is not durable.** Tasks drop silently on Redis restart. No workflow visibility. Retry state lives in Redis with no durability guarantee.
+4. **No rate limit awareness.** There is a harder version of the capacity problem that the current system does not handle at all: LLM APIs have hard rate limits (tokens per minute, requests per minute). At 100K calls arriving rapidly, the system fires LLM requests at full speed and fails with 429s — no queuing, no scheduling, no budget management.
+
+---
+
+## The Core Problem to Solve
+
+> **LLM APIs have hard rate limits. The current system has no awareness of them.**
+
+Consider what happens during a campaign run:
+
+- 100,000 calls complete within a few hours
+- Every call fires an LLM request (current behaviour)
+- LLM provider limit: e.g., 500 requests/min, 90,000 tokens/min
+- At peak, the system tries to send 5,000+ requests/min → 429 rate limit errors → Celery retries pile up → Redis fills → more failures
+
+The system has to decide, across 100K calls:
+- Which analysis results are needed **now** (business can't wait)
+- Which can be **deferred** to a time when rate limit headroom exists
+- How to **allocate** the available rate limit fairly across multiple customers running campaigns simultaneously
+
+This is not purely a technical throughput problem. The business has context that the system does not: some call outcomes matter more than others, and some customers have higher priority or pre-allocated budgets. Your design must create a way to express and enforce that context.
+
+**What "some calls need immediate processing" means in practice** is something you need to reason about and state as an assumption. The codebase gives you sample transcripts with varied outcomes — use them to inform your thinking. How you distinguish urgent from deferrable, and what mechanism you use to do so, is a core part of the design question.
 
 ---
 
 ## The Challenge
 
-Design and implement a new post-call processing pipeline that solves the above problems. You will deliver:
+Design and implement a new post-call processing pipeline. You will deliver two things:
 
-### Part 1: Design Document (SUBMISSION.md)
+### Part 1: Design Document (`SUBMISSION.md`)
 
-Write your technical design in `SUBMISSION.md`. It should cover:
+Write your technical design. It must cover:
 
-1. **Architecture overview** — How does the new system flow from call-end webhook to completed analysis? Include a diagram (ASCII or Mermaid).
+1. **Assumptions** — What did you assume about the business, the system, or the environment? State them explicitly upfront. We will discuss them.
 
-2. **Triage / filtering strategy** — How do you decide which calls need immediate full LLM analysis vs. which can be deferred or processed cheaply? What's your classification approach?
+2. **Architecture overview** — End-to-end flow from call-end webhook to completed analysis. Include a diagram.
 
-3. **Two-lane processing** — Design a "hot lane" (immediate, high-priority) and "cold lane" (deferred, batch) processing path. Define:
-   - What triggers each lane
-   - SLA targets for each lane
-   - Cost model (how much do you save vs. current system?)
+3. **Rate limit management** — This is the primary problem. How does your system respect LLM rate limits across 100K calls and multiple concurrent customers? How does it decide what to process now vs. later? How does it recover gracefully when limits are hit?
 
-4. **Recording pipeline fix** — Replace the 45-second sleep with a robust polling/retry mechanism. Recording should never silently fail.
+4. **Per-customer token budgeting** — If the platform has a total LLM budget of N tokens/min and K active customers, how do you allocate it? For example: if total capacity is 100 tokens/min and Customer A pre-allocates 20, what guarantees do they get? What happens when they exceed their budget? What happens to unallocated headroom?
 
-5. **Dialler coupling** — How do you replace the binary circuit breaker with gradual backpressure? The dialler should slow down proportionally, not freeze entirely.
+5. **Recording pipeline fix** — Replace the 45-second sleep. What does a robust polling/retry mechanism look like, and how do you ensure failures are always visible?
 
-6. **Data model** — What new tables/columns do you need? How do you separate the source of truth (full analysis results) from the hot cache (dashboard reads)?
+6. **Reliability & durability** — How do you ensure no analysis result is permanently lost? What replaces the fragile Celery + Redis combination?
 
-7. **Observability** — What do you log, what do you alert on, what dashboards do you build?
+7. **Auditability & observability** — What do you log? How would an on-call engineer debug a specific failed interaction 3 days later? What alerts fire and on what conditions?
 
-8. **Trade-offs and alternatives considered** — What did you consider and reject? Why?
+8. **Data model** — What schema changes does your design require?
+
+9. **Security** — What data is sensitive in this system, and how do you protect it? (Consider: transcripts contain conversation data, lead PII, and call recordings.)
+
+10. **Trade-offs** — What did you consider and reject? What are the known weaknesses of your design?
 
 ### Part 2: Implementation
 
-Implement your design. The scope is intentionally larger than what can be fully completed — we want to see how you prioritise.
+Implement the highest-impact parts of your design. The scope is deliberately larger than any single session — we are evaluating judgment as much as execution.
 
 **Must implement:**
-- [ ] The triage/filtering layer that classifies calls before full LLM analysis
-- [ ] Hot lane and cold lane routing logic
+- [ ] Rate limit–aware LLM request scheduling (the core fix)
+- [ ] Per-customer token budget enforcement
 - [ ] Recording poller with retry/backoff (replacing `asyncio.sleep(45s)`)
-- [ ] Data model changes (new tables, schema migration)
-- [ ] Tests that validate your triage logic against the sample transcripts in `tests/fixtures/sample_transcripts.json`
+- [ ] Durable task execution — no silent drops on infrastructure failure
+- [ ] Structured audit logging — every interaction traceable from call-end to result
 
-**Should implement (if time permits):**
-- [ ] Workflow orchestration (Temporal, or equivalent durable execution)
-- [ ] Batch API integration for cold lane
-- [ ] Quota tracking and gradual backpressure for dialler coupling
-- [ ] Observability: structured logging, alert thresholds
+**Should implement:**
+- [ ] Differentiated processing paths (some calls processed now, others deferred) — your design decides the mechanism
+- [ ] Data model changes with schema migration
+- [ ] Alert thresholds tied to rate limit utilisation
+- [ ] Tests validating rate limit behaviour under load (can be simulated)
 
 **Nice to have:**
-- [ ] Per-customer NLU configuration (different keyword rules per customer)
-- [ ] CRM push with retry logic
-- [ ] Dashboard update mechanism (hot cache writes)
+- [ ] Encryption at rest for transcripts and recordings
+- [ ] Per-customer configuration for processing behaviour (no deployment required to change)
+- [ ] CRM push with retry logic and status tracking
+- [ ] Gradual dialler backpressure replacing the binary circuit breaker
 
 ---
 
 ## Constraints
 
-These are non-negotiable requirements your solution must satisfy:
+1. **No analysis result may be permanently lost.** If a processing step fails, there must be a retry mechanism with visibility. Silent drops are not acceptable.
 
-1. **The FastAPI endpoint interface does not change.** `POST /session/{sid}/interaction/{iid}/end` must continue to work with the same request/response schema. The endpoint must return 200 immediately (non-blocking).
+2. **The system must handle 100K calls per campaign run** while respecting LLM rate limits — never triggering unhandled 429 errors.
 
-2. **No analysis result may be permanently lost.** If a processing step fails, there must be a retry mechanism with visibility. Silent drops are unacceptable.
+3. **All LLM spending must be attributable.** Every token consumed must be traceable to a customer, campaign, and interaction. This is required for both billing and debugging.
 
-3. **The system must handle 100K calls per campaign run** without building a backlog that delays high-value calls by more than 15 minutes.
+4. **Recording failures must produce observable events.** Every recording that fails to upload must log a structured, alertable event. Silent skips are not acceptable.
 
-4. **LLM API costs must be reduced by at least 30%** compared to the current "full analysis on every call" approach. Show your cost model.
+5. **The solution must be testable locally** with `docker-compose up` (Postgres + Redis) and mock LLM responses. No real API keys required to run tests.
 
-5. **Recording failures must be observable.** Every recording that fails to upload must produce a logged, alertable event — never a silent skip.
-
-6. **Per-customer configurability.** Different customers have different definitions of "actionable" calls. The triage logic must be configurable per customer without code deployment.
-
-7. **The solution must be testable locally** with `docker-compose up` (Postgres + Redis) and mock LLM responses. No real API keys required.
+6. **Justify your interface decisions.** If you change the API contract (`POST /session/.../end`) or the data model, explain why in `SUBMISSION.md`.
 
 ---
 
 ## Acceptance Criteria
 
-Your submission is evaluated against these criteria:
-
 | # | Criterion | How We Verify |
 |---|-----------|--------------|
-| AC1 | Triage filter correctly routes ≥90% of sample transcripts to the expected lane | Run your tests against `sample_transcripts.json` — hot calls → hot lane, cold calls → cold lane |
-| AC2 | Triage configuration changeable per customer without deployment | Update config (DB or file), observe next call uses new config |
-| AC3 | Hot lane end-to-end SLA ≤ 5 minutes (call end → result written) | Integration test or simulation showing p98 latency |
-| AC4 | Cold lane uses a cheaper processing path (batch API or deferred) | Code inspection: cold lane calls are not processed via streaming/real-time LLM |
-| AC5 | Recording poller retries with backoff; never silently skips | Unit test: simulate delayed recording, verify retry loop and failure logging |
-| AC6 | Analysis results stored in append-only table (source of truth) separate from dashboard cache | Schema inspection: two separate storage locations with clear write sequence |
-| AC7 | Post-call LLM backlog does not binary-freeze the dialler | Design doc explains gradual backpressure; no hardcoded 1800s freeze |
-| AC8 | All failures produce structured, alertable log events | Code inspection: every error path emits a structured log with interaction_id |
-| AC9 | Solution handles short transcripts (< 4 turns) without LLM cost | Test: short transcript → no LLM call, status updated directly |
-| AC10 | Cost model shows ≥30% reduction vs. current approach | Design doc includes calculation with assumptions stated |
+| AC1 | System never fires LLM requests beyond configured rate limits | Test: simulate burst of 1000 calls, assert no 429s surfaced to callers |
+| AC2 | Per-customer token budget enforced — Customer A's budget does not consume Customer B's allocation | Unit test: exhaust Customer A's budget, verify Customer B's calls still process |
+| AC3 | No task is permanently lost when Redis or Celery worker restarts mid-processing | Integration test: kill worker mid-task, verify task resumes on restart |
+| AC4 | Recording poller retries with backoff; never silently skips | Unit test: simulate delayed recording, verify retry loop and failure logging |
+| AC5 | Every interaction has a complete audit trail from call-end to final result | Log inspection: assert structured events exist for each stage of one interaction |
+| AC6 | All failures produce structured log events with `interaction_id` | Code inspection: every error path emits structured log with correlation ID |
+| AC7 | Dialler is not binary-frozen when LLM is under load | Design doc + code: no hardcoded 1800s freeze; backpressure is proportional |
+| AC8 | Short transcripts (< 4 turns) never consume LLM quota | Test: short transcript → no LLM call, interaction status updated directly |
+| AC9 | Design doc states assumptions clearly and defends trade-offs | Manual review: assumptions are explicit, not implicit |
+| AC10 | Sensitive data (transcripts, PII) identified and protection strategy stated | Design doc: security section addresses data at rest and in transit |
 
 ---
 
 ## Evaluation Criteria
 
-We evaluate along four dimensions:
+### 1. Problem Framing (25%)
+- Did the candidate correctly identify rate limit management as the root problem?
+- Are assumptions stated explicitly and reasonably?
+- Does the design doc show understanding of how business context (urgency, customer priority) connects to technical decisions?
 
-### 1. System Design (40%)
-- Is the architecture sound? Does it handle the stated scale?
+### 2. System Design (35%)
+- Is the rate limit management strategy sound at 100K call scale?
+- Is the per-customer budget model well-reasoned?
 - Are failure modes addressed with real solutions, not hand-waving?
-- Are trade-offs explicitly stated and reasoned about?
+- Does the design handle the recording pipeline, durability, and observability?
 
-### 2. Code Quality (30%)
-- Is the code clean, well-structured, and production-ready?
-- Are the right abstractions chosen (not over-engineered, not under-engineered)?
-- Error handling: does the code fail gracefully with visibility?
+### 3. Code Quality (25%)
+- Is the implementation clean and production-ready?
+- Does it actually integrate with the existing codebase, or is it floating code?
+- Error handling: does the system fail gracefully with visibility?
 
-### 3. Prioritisation & Judgment (20%)
-- Given limited time, did the candidate build the highest-impact pieces first?
-- Are "should implement" items attempted only after "must implement" is solid?
-- Does the candidate know when to stop and document vs. keep coding?
-
-### 4. Communication (10%)
-- Is the design document clear and concise?
-- Can a team member understand the architecture from the doc alone?
+### 4. Communication (15%)
+- Is the design document clear enough for a new team member to implement from?
 - Are decisions explained, not just stated?
+- Does the candidate surface the right questions?
 
 ---
 
 ## Rules
 
-- **You may use AI tools** (Copilot, ChatGPT, Claude, etc.). This is explicitly allowed. However:
-  - You must be able to **explain every design decision** in your submission
-  - Copy-pasting without understanding will be obvious in the follow-up discussion
-  - AI-generated code that doesn't integrate with the existing codebase will be penalised
+- **You may use AI tools** (Copilot, ChatGPT, Claude, etc.). This is explicitly allowed.
+  - You must be able to **explain every design decision** in your submission and in the follow-up discussion
+  - AI-generated design that isn't adapted to this specific system will be visible
+  - AI-generated code that doesn't integrate with the existing codebase is penalised
 
-- **Time budget: 4–6 hours.** You will not finish everything. That's intentional. We're testing judgment as much as execution.
+- **Submit via git.** A clean commit history showing your progression is part of the submission. Atomic commits with clear messages matter.
 
-- **Submit via git.** Your final submission should be a clean git history showing your progression. Atomic commits with clear messages are valued.
+- **State your assumptions.** If something is ambiguous, don't guess silently — write it down in `SUBMISSION.md` and proceed. Reasonable assumptions are part of what we're evaluating.
 
 ---
 
 ## Getting Started
 
 ```bash
-# 1. Clone and explore the current system
-cd sde-assignment
-cat src/tasks/celery_tasks.py    # Start here — this is the core problem
+# 1. Read the current system — understand before changing
+cat src/config.py                        # Note the rate limit settings
+cat src/tasks/celery_tasks.py            # The main processing pipeline
+cat src/services/recording.py            # The 45s sleep
+cat src/services/circuit_breaker.py      # The blunt capacity check
 
-# 2. Read the sample transcripts
+# 2. Read the sample transcripts — these are your test cases
 cat tests/fixtures/sample_transcripts.json
 
-# 3. Start infrastructure (optional, for integration testing)
+# 3. Start infrastructure
 docker-compose up -d
 
-# 4. Run existing tests
+# 4. Run existing tests (they document current behaviour)
 pip install -r requirements.txt
 pytest tests/ -v
 
 # 5. Start your design document
 cp SUBMISSION_TEMPLATE.md SUBMISSION.md
-# Edit SUBMISSION.md with your design
 
 # 6. Implement your solution
-# Modify existing files and add new ones as needed
+# You may change any part of the codebase, including the API interface.
+# Explain significant interface changes in SUBMISSION.md.
 ```
 
 ---
 
 ## Questions?
 
-If anything in the problem statement is ambiguous, **state your assumption in SUBMISSION.md and proceed.** In a real system design, you'd ask the team — here, reasonable assumptions are part of the evaluation.
-
-Good luck.
+If anything is ambiguous, **state your assumption and proceed.** The follow-up discussion is where we explore assumptions — the submission is where you show your thinking.
