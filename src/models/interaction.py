@@ -69,6 +69,14 @@ class Interaction(Base):
     retry_count = Column(Integer, default=0)
     error_log = Column(JSONB, default=list)
 
+    # Workflow-level status (added in migration 001). The dashboard hot
+    # cache lives in interaction_metadata JSONB; these explicit columns
+    # let the dispatcher and ops queries avoid JSONB extraction.
+    analysis_status = Column(String(32), default="pending")
+    recording_status = Column(String(32), default="pending")
+    processing_lane = Column(String(16), nullable=True)
+    correlation_id = Column(Text, nullable=True)
+
     created_at = Column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
