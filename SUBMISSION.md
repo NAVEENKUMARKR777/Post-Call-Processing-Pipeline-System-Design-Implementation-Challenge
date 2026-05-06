@@ -721,19 +721,167 @@ Prioritised by impact:
 
 ---
 
+## How to Run and Verify
+
+### 1. Install dependencies
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+No infrastructure needed for the unit-test suite — `fakeredis[lua]` emulates Redis (including Lua scripting) in-process and mock `AsyncSession` stubs Postgres.
+
+### 2. Run the full unit-test suite
+
+```bash
+pytest tests/ -v
+# Expected: 92 passed
+```
+
+Run a single acceptance-criteria group:
+
+```bash
+# AC1 — no 429s under burst load
+pytest tests/test_rate_limiter.py -v
+
+# AC2 — per-customer budget isolation
+pytest tests/test_budget_manager.py -v
+
+# AC3 — durable execution / worker-crash recovery
+pytest tests/test_durable_tasks.py -v
+
+# AC4 — recording poller with retry and failure visibility
+pytest tests/test_recording_poller.py -v
+
+# AC5 + AC6 — complete audit trail, every error has interaction_id
+pytest tests/test_audit_trail.py -v
+
+# AC7 — proportional backpressure, no 1800s freeze
+pytest tests/test_backpressure.py -v
+
+# AC8 — short transcripts skip LLM
+pytest tests/test_pre_classifier.py tests/test_llm_worker.py::test_short_transcript_never_reaches_llm_worker -v
+```
+
+### 3. Start infrastructure (Postgres + Redis)
+
+```bash
+docker-compose up -d
+# Postgres starts on localhost:5432, Redis on localhost:6379.
+# The schema (data/schema.sql) and migration
+# (migrations/001_durability_and_budgets.sql) are applied
+# automatically by docker-entrypoint-initdb.d on first boot.
+```
+
+Verify the schema was applied:
+
+```bash
+docker exec -it $(docker-compose ps -q postgres) \
+  psql -U postgres -d voicebot -c "\dt"
+# Expected tables: sessions, leads, interactions, processing_tasks,
+#   customer_llm_budgets, interaction_audit_log, llm_token_ledger
+```
+
+Verify the migration seeded fixture customer budgets:
+
+```bash
+docker exec -it $(docker-compose ps -q postgres) \
+  psql -U postgres -d voicebot \
+  -c "SELECT customer_id, reserved_tpm, priority FROM customer_llm_budgets;"
+```
+
+### 4. Start the API server
+
+```bash
+export DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/voicebot"
+export REDIS_URL="redis://localhost:6379/0"
+uvicorn src.app:app --reload --port 8000
+```
+
+### 5. Smoke-test the endpoint
+
+Post a call-end webhook with a hot-lane (rebook) transcript:
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/session/$(python -c "import uuid; print(uuid.uuid4())")/interaction/$(python -c "import uuid; print(uuid.uuid4())")/end \
+  -H "Content-Type: application/json" \
+  -d '{
+    "call_sid": "smoke-test-001",
+    "duration_seconds": 120,
+    "call_status": "completed",
+    "additional_data": {}
+  }' | python -m json.tool
+# Expected: {"status":"ok","interaction_id":"...","correlation_id":"...","lane":"cold","message":"..."}
+```
+
+Verify the `processing_tasks` row was written:
+
+```bash
+docker exec -it $(docker-compose ps -q postgres) \
+  psql -U postgres -d voicebot \
+  -c "SELECT step, lane, status, next_run_at FROM processing_tasks ORDER BY created_at DESC LIMIT 5;"
+```
+
+Verify the audit trail was started:
+
+```bash
+docker exec -it $(docker-compose ps -q postgres) \
+  psql -U postgres -d voicebot \
+  -c "SELECT step, status, occurred_at FROM interaction_audit_log ORDER BY occurred_at DESC LIMIT 10;"
+```
+
+### 6. Start Celery workers and observe end-to-end processing
+
+```bash
+# Terminal 1 — hot-lane + signal/lead workers
+celery -A src.tasks.celery_app worker \
+  --queues hot_lane \
+  --concurrency 2 \
+  --loglevel INFO
+
+# Terminal 2 — cold-lane + recording poller
+celery -A src.tasks.celery_app worker \
+  --queues cold_lane,recording_poll \
+  --concurrency 2 \
+  --loglevel INFO
+```
+
+After a worker drains the `processing_tasks` rows, verify completion:
+
+```bash
+docker exec -it $(docker-compose ps -q postgres) \
+  psql -U postgres -d voicebot \
+  -c "SELECT step, status, attempts, actual_tokens FROM processing_tasks ORDER BY created_at DESC LIMIT 10;"
+# Expected status: 'completed' for all steps.
+
+# Verify token ledger was written for the LLM step:
+docker exec -it $(docker-compose ps -q postgres) \
+  psql -U postgres -d voicebot \
+  -c "SELECT customer_id, tokens_used, model, occurred_at FROM llm_token_ledger ORDER BY occurred_at DESC LIMIT 5;"
+```
+
+### 7. Verify backpressure endpoint
+
+```bash
+curl -s "http://localhost:8000/api/v1/dialler/backpressure?lane=hot" | python -m json.tool
+# Expected: {"throttle_factor": 1.0, "utilization_pct": <N>, ...}
+```
+
+---
+
 ## Acceptance-Criteria Summary
 
 | AC  | Verification |
 |-----|--------------|
-| AC1 | [tests/test_rate_limiter.py::test_burst_1000_calls_no_429](tests/test_rate_limiter.py) — 1000 reservations against 90K TPM, exactly 60 allowed, 940 deferred, zero 429s. |
-| AC2 | [tests/test_budget_manager.py::test_customer_a_exhaustion_does_not_affect_b](tests/test_budget_manager.py) |
-| AC3 | [tests/test_durable_tasks.py](tests/test_durable_tasks.py) — lease expiry, idempotency, dead-letter on max attempts. |
-| AC4 | [tests/test_recording_poller.py](tests/test_recording_poller.py) — backoff retry + dead-letter + structured failure events. |
-| AC5 | [tests/test_audit_trail.py::test_full_interaction_lifecycle_produces_complete_audit_trail](tests/test_audit_trail.py) |
-| AC6 | [tests/test_audit_trail.py::test_failure_audit_row_includes_interaction_id_and_error](tests/test_audit_trail.py) |
-| AC7 | [tests/test_backpressure.py](tests/test_backpressure.py) — proportional curve, no 1800s freeze, `test_no_hardcoded_1800s_freeze_anywhere` greps the module. |
-| AC8 | [tests/test_llm_worker.py::test_short_transcript_never_reaches_llm_worker](tests/test_llm_worker.py) + [tests/test_pre_classifier.py](tests/test_pre_classifier.py) |
-| AC9 | This document (§1) |
-| AC10 | This document (§11) |
+| AC1 | `pytest tests/test_rate_limiter.py -v` — 1000 reservations against 90K TPM, exactly 60 allowed, 940 deferred, zero 429s. |
+| AC2 | `pytest tests/test_budget_manager.py -v` — exhaust Customer A, verify Customer B unaffected. |
+| AC3 | `pytest tests/test_durable_tasks.py -v` — lease expiry, idempotency, dead-letter on max attempts. |
+| AC4 | `pytest tests/test_recording_poller.py -v` — backoff retry + dead-letter + structured failure events. |
+| AC5 | `pytest tests/test_audit_trail.py::test_full_interaction_lifecycle_produces_complete_audit_trail -v` |
+| AC6 | `pytest tests/test_audit_trail.py::test_failure_audit_row_includes_interaction_id_and_error -v` |
+| AC7 | `pytest tests/test_backpressure.py -v` — proportional curve, no 1800s freeze, `test_no_hardcoded_1800s_freeze_anywhere` greps the module. |
+| AC8 | `pytest tests/test_pre_classifier.py tests/test_llm_worker.py::test_short_transcript_never_reaches_llm_worker -v` |
+| AC9 | This document (§1) — assumptions stated explicitly. |
+| AC10 | This document (§11) — PII protection at rest and in transit. |
 
-92 unit tests pass against `pytest tests/` with no infrastructure required (fakeredis + mock AsyncSession). End-to-end behaviour is validated against Postgres + Redis under `docker-compose up`.
+92 unit tests pass against `pytest tests/` with no infrastructure required (fakeredis + mock AsyncSession). End-to-end behaviour is validated against Postgres + Redis under `docker-compose up` per the steps above.
