@@ -6,7 +6,6 @@ from typing import Any, Optional
 from sqlalchemy import (
     Column,
     DateTime,
-    Enum,
     ForeignKey,
     Integer,
     String,
@@ -42,9 +41,11 @@ class Interaction(Base):
     customer_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     agent_id = Column(UUID(as_uuid=True), nullable=False, index=True)
 
-    status = Column(
-        Enum(InteractionStatus), default=InteractionStatus.INITIATED, nullable=False
-    )
+    # data/schema.sql defines this as VARCHAR(20). The ORM mirrors
+    # that — using a Postgres-native ENUM here would require a
+    # separate CREATE TYPE in the migration, which isn't worth the
+    # rigidity (new statuses today need both a deploy and a DDL).
+    status = Column(String(20), default=InteractionStatus.INITIATED.value, nullable=False)
     call_sid = Column(String(255), nullable=True, index=True)
     call_provider = Column(String(50), default="exotel")
 

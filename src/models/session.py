@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Enum, ForeignKey, String, func
+from sqlalchemy import Column, DateTime, ForeignKey, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -26,9 +26,8 @@ class Session(Base):
     customer_id = Column(UUID(as_uuid=True), nullable=False, index=True)
     agent_id = Column(UUID(as_uuid=True), nullable=False, index=True)
 
-    status = Column(
-        Enum(SessionStatus), default=SessionStatus.ACTIVE, nullable=False
-    )
+    # data/schema.sql defines this as VARCHAR(20); the ORM mirrors that.
+    status = Column(String(20), default=SessionStatus.ACTIVE.value, nullable=False)
 
     created_at = Column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
