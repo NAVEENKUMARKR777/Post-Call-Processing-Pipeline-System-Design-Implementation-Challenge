@@ -1,3 +1,8 @@
+from src.scheduler.backpressure import (
+    BackpressureController,
+    BackpressureRecommendation,
+    Lane as DiallerLane,
+)
 from src.scheduler.budget_manager import BudgetManager, BudgetReservation
 from src.scheduler.rate_limiter import (
     RateLimitDecision,
@@ -17,10 +22,13 @@ from src.scheduler.task_dispatcher import (
 )
 
 __all__ = [
+    "BackpressureController",
+    "BackpressureRecommendation",
     "BudgetManager",
     "BudgetReservation",
     "DEFAULT_BACKOFF_SCHEDULE",
     "DEFAULT_LEASE_SECONDS",
+    "DiallerLane",
     "RateLimitDecision",
     "RateLimiter",
     "Reservation",

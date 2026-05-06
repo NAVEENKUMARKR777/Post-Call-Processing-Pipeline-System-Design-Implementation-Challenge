@@ -28,7 +28,6 @@ from typing import Any, Dict, Optional
 from dataclasses import dataclass
 
 from src.config import settings
-from src.services.circuit_breaker import circuit_breaker
 
 logger = logging.getLogger(__name__)
 
@@ -63,16 +62,12 @@ class AnalysisResult:
 
 
 class PostCallProcessor:
-    """
-    Runs full LLM analysis on a transcript.
+    """Runs full LLM analysis on a transcript and writes the result
+    into the interactions row's interaction_metadata JSONB column.
 
-    Currently called for every interaction that isn't a short call.
-    No pre-screening, no quota check before firing, no customer-level budgeting.
-
-    The circuit_breaker.record_postcall_start() call increments a Redis counter
-    used by the dialler's capacity check. But it tracks in-flight tasks, not
-    actual tokens/minute. By the time the circuit breaker trips (at 90% RPM),
-    we've already been 429-ing for a while.
+    Rate-limit and per-customer budget gating lives one layer up in
+    src/tasks/workers/llm_worker.py — by the time process_post_call
+    is reached, capacity has already been reserved.
     """
 
     async def process_post_call(
@@ -91,11 +86,10 @@ class PostCallProcessor:
           - Consider whether this call's outcome even warrants full analysis
         """
 
-        # Tells the circuit breaker an LLM request is in flight.
-        # Note: this increments llm:postcall:rpm but doesn't check it first.
-        # The check happens in circuit_breaker.check_capacity(), which is
-        # called by the dialler — not here, before spending the tokens.
-        await circuit_breaker.record_postcall_start()
+        # Rate-limit gating now lives in src/scheduler/budget_manager.py
+        # — invoked by src/tasks/workers/llm_worker.py BEFORE this
+        # processor is called. By the time we reach _call_llm we have
+        # already reserved capacity and the LLM call is sanctioned.
 
         try:
             prompt = self._build_analysis_prompt(
@@ -144,9 +138,6 @@ class PostCallProcessor:
                 },
             )
             raise
-
-        finally:
-            await circuit_breaker.record_postcall_end()
 
     def _build_analysis_prompt(
         self,
