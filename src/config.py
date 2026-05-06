@@ -35,9 +35,17 @@ class Settings:
     LLM_AVG_TOKENS_PER_CALL: int = int(os.getenv("LLM_AVG_TOKENS_PER_CALL", "1500"))
 
     # ── Recording ─────────────────────────────────────────────────────────────
-    # Why 45 seconds? Someone measured the average Exotel delivery time once,
-    # added a buffer, and hardcoded it. That was on a quiet Friday afternoon.
-    # Under load the delivery window is 10s–120s with no guarantee.
+    # Replaces the previous hardcoded 45s sleep. The poller schedules
+    # six attempts at increasing intervals (5s, 15s, 30s, 60s, 120s,
+    # 240s) — covering the documented 10s–120s Exotel delivery window
+    # plus a margin. After exhaustion the recording_status flips to
+    # 'failed' and an ERROR-level alert fires; the analysis itself is
+    # already done by then because LLM analysis no longer waits for
+    # the recording.
+    RECORDING_BACKOFF_SECONDS: tuple[int, ...] = (5, 15, 30, 60, 120, 240)
+    RECORDING_MAX_ATTEMPTS: int = 6
+    # Legacy: read in the old recording.py path; kept so docker-up
+    # doesn't break during the cut-over commit.
     RECORDING_WAIT_SECONDS: int = 45
     S3_BUCKET: str = os.getenv("S3_BUCKET", "voicebot-recordings")
 
