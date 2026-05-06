@@ -37,6 +37,7 @@ from src.models.processing_task import ProcessingTask, TaskStep
 from src.observability import bind_correlation_id, bind_interaction_context, clear_context
 from src.scheduler import BudgetManager, RateLimiter
 from src.tasks.celery_app import celery_app
+from src.tasks.workers.crm_worker import execute_crm_push
 from src.tasks.workers.lead_stage_worker import execute_lead_stage
 from src.tasks.workers.llm_worker import execute_llm_analysis
 from src.tasks.workers.signal_worker import execute_signal_jobs
@@ -129,6 +130,11 @@ def dispatch_signal_jobs(task_id: str):
 @celery_app.task(name="dispatch.lead_stage", queue="hot_lane", acks_late=True, max_retries=0)
 def dispatch_lead_stage(task_id: str):
     _run_async(_process_one(task_id, execute_lead_stage))
+
+
+@celery_app.task(name="dispatch.crm_push", queue="cold_lane", acks_late=True, max_retries=0)
+def dispatch_crm_push(task_id: str):
+    _run_async(_process_one(task_id, execute_crm_push))
 
 
 # Legacy task name kept as a tombstone import target so any in-flight
