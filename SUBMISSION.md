@@ -160,6 +160,8 @@ skip-lane shortcut:
 
 `signal_jobs` and `lead_stage` are **not** enqueued at endpoint time because their payloads include `analysis_result.call_stage`, which isn't known until the LLM finishes. The LLM worker enqueues them inside the same DB session as its own `mark_completed()` call — so the downstream rows appear atomically when the LLM result is committed. If the LLM worker crashes after `mark_completed()` but before the fan-out enqueues commit, the **entire session is rolled back**: the task reverts to `in_progress` with its stale lease and another worker reclaims it, re-runs the analysis, and re-enqueues the downstream steps — idempotently, because the UNIQUE constraint makes re-enqueue a no-op.
 
+**How the Celery message reaches the queue:** the worker harness `_process_one` ([src/tasks/celery_tasks.py](src/tasks/celery_tasks.py)) commits the worker session, then opens a **fresh session** to query for any new `pending` rows on the same `interaction_id` and calls `.delay()` on each step's matching dispatcher (looked up in `_DOWNSTREAM_DISPATCH`). Querying after commit avoids the race where the Celery message would arrive before the row is durable. If Celery is unreachable at dispatch time, the rows stay `pending` in `processing_tasks` and the periodic `expire_stale_leases()` sweep can re-dispatch them — Celery is the trigger, Postgres is the source of truth.
+
 ---
 
 ## 4. Rate Limit Management
@@ -368,6 +370,24 @@ Rationale: the system's goal is to process calls without surfacing 429s. If Redi
 Implementation: wrap `check_and_reserve` in a try/except; on `RedisError`, log at ERROR level with `redis_fallback=True` and return a synthetic ALLOW reservation with `estimated_tokens` set to the estimate. This reservation is also skipped at reconcile time (no ZSET to update). The token ledger still records actual consumption, so post-outage attribution is preserved.
 
 Sentinel thresholds: a separate health-check probe pings Redis every 10 seconds; three consecutive failures page the on-call engineer before the rate limiter is meaningfully compromised.
+
+### Celery dispatch is best-effort, Postgres is durable
+
+The endpoint and worker harness both follow the **outbox pattern**:
+
+1. Write the `processing_tasks` row inside the DB transaction with the interaction state change.
+2. `await db.commit()`.
+3. Call `dispatch_*.delay(str(task.id))` on the matching Celery task.
+
+Step 3 is best-effort. If the Redis broker is down, the `.delay()` call may raise; if it doesn't raise but the message is lost, the row still exists in `processing_tasks`. The `expire_stale_leases()` sweep catches these — any `pending` or `scheduled` row whose `next_run_at <= now()` is a candidate for re-dispatch. **Celery is the trigger, never the source of truth.**
+
+This means the system survives:
+
+- A FastAPI restart between commit (step 2) and dispatch (step 3) — the row is durable; the sweep re-dispatches.
+- A Redis broker restart that drops in-flight messages — same recovery path.
+- A Celery worker that picks up the message, claims the row via `SELECT ... FOR UPDATE SKIP LOCKED`, then dies — lease expires, sweep re-dispatches.
+
+The only failure mode that can lose work is `pg_data` loss without backup, which is the same risk all Postgres-backed systems share.
 
 ### Graceful shutdown
 
@@ -790,82 +810,140 @@ docker exec -it $(docker-compose ps -q postgres) \
   -c "SELECT customer_id, reserved_tpm, priority FROM customer_llm_budgets;"
 ```
 
-### 4. Start the API server
+### 4. Seed a test lead, session, and interaction
+
+The endpoint resolves the interaction by primary key; `processing_tasks.interaction_id` has a foreign key to `interactions.id`. So the smoke test needs at least one row in `leads`, `sessions`, and `interactions` before the endpoint can write its workflow rows. Save the following as `seed_smoke.sql`:
+
+```sql
+INSERT INTO leads (id, customer_id, campaign_id, phone, name, stage)
+VALUES (
+  'a0000000-0000-0000-0000-000000000001',
+  'd0000000-0000-0000-0000-000000000001',
+  'c0000000-0000-0000-0000-000000000001',
+  '+919900000001', 'Test Lead', 'new'
+) ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO sessions (id, lead_id, campaign_id, customer_id, agent_id, status)
+VALUES (
+  '1fd667e0-676d-4330-97e4-fc7b48978c3c',
+  'a0000000-0000-0000-0000-000000000001',
+  'c0000000-0000-0000-0000-000000000001',
+  'd0000000-0000-0000-0000-000000000001',
+  'e0000000-0000-0000-0000-000000000001',
+  'ACTIVE'
+) ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO interactions (id, session_id, lead_id, campaign_id, customer_id, agent_id, status, conversation_data)
+VALUES (
+  'ff000000-0000-0000-0000-000000000006',
+  '1fd667e0-676d-4330-97e4-fc7b48978c3c',
+  'a0000000-0000-0000-0000-000000000001',
+  'c0000000-0000-0000-0000-000000000001',
+  'd0000000-0000-0000-0000-000000000001',
+  'e0000000-0000-0000-0000-000000000001',
+  'IN_PROGRESS',
+  '{"transcript":[{"role":"agent","content":"Hello, am I speaking with Mr. Kumar?"},{"role":"customer","content":"Yes, speaking."},{"role":"agent","content":"Calling about your product inquiry."},{"role":"customer","content":"Yes I was interested."},{"role":"agent","content":"Would you like to schedule a demo?"},{"role":"customer","content":"Yes, Thursday confirmed."}]}'
+) ON CONFLICT (id) DO NOTHING;
+```
+
+```bash
+docker cp seed_smoke.sql $(docker-compose ps -q postgres):/tmp/seed_smoke.sql
+docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot -f /tmp/seed_smoke.sql
+```
+
+### 5. Start the API server
 
 ```bash
 export DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/voicebot"
 export REDIS_URL="redis://localhost:6379/0"
-uvicorn src.app:app --reload --port 8000
+uvicorn src.app:app --port 8080 --host 0.0.0.0
+# Note: port 8080 instead of 8000. On some Windows installations
+# port 8000 is blocked by AppContainer/HNS reservation; 8080 is
+# the next free dev port.
 ```
 
-### 5. Smoke-test the endpoint
+### 6. Smoke-test the endpoint
 
-Post a call-end webhook with a hot-lane (rebook) transcript:
+Post a call-end webhook against the seeded interaction:
 
 ```bash
-curl -s -X POST http://localhost:8000/api/v1/session/$(python -c "import uuid; print(uuid.uuid4())")/interaction/$(python -c "import uuid; print(uuid.uuid4())")/end \
+curl -s -X POST \
+  http://localhost:8080/api/v1/session/1fd667e0-676d-4330-97e4-fc7b48978c3c/interaction/ff000000-0000-0000-0000-000000000006/end \
   -H "Content-Type: application/json" \
-  -d '{
-    "call_sid": "smoke-test-001",
-    "duration_seconds": 120,
-    "call_status": "completed",
-    "additional_data": {}
-  }' | python -m json.tool
-# Expected: {"status":"ok","interaction_id":"...","correlation_id":"...","lane":"cold","message":"..."}
+  -d '{"call_sid":"smoke-test-001","duration_seconds":90,"call_status":"completed","additional_data":{}}' \
+  | python -m json.tool
+# Expected: {"status":"ok","lane":"hot","correlation_id":"...","message":"..."}
 ```
 
-Verify the `processing_tasks` row was written:
+Verify the `processing_tasks` rows and audit log:
 
 ```bash
-docker exec -it $(docker-compose ps -q postgres) \
-  psql -U postgres -d voicebot \
-  -c "SELECT step, lane, status, next_run_at FROM processing_tasks ORDER BY created_at DESC LIMIT 5;"
+docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot \
+  -c "SELECT step, lane, status, next_run_at FROM processing_tasks WHERE interaction_id='ff000000-0000-0000-0000-000000000006' ORDER BY created_at;"
+docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot \
+  -c "SELECT step, status, attempt, occurred_at FROM interaction_audit_log WHERE interaction_id='ff000000-0000-0000-0000-000000000006' ORDER BY occurred_at;"
 ```
 
-Verify the audit trail was started:
+At this point — before any worker has run — there should be a `recording_poll` and an `llm_analysis` row, both `pending`, with two matching `enqueued` audit rows.
+
+### 7. Start the Celery worker and observe end-to-end processing
 
 ```bash
-docker exec -it $(docker-compose ps -q postgres) \
-  psql -U postgres -d voicebot \
-  -c "SELECT step, status, occurred_at FROM interaction_audit_log ORDER BY occurred_at DESC LIMIT 10;"
-```
-
-### 6. Start Celery workers and observe end-to-end processing
-
-```bash
-# Terminal 1 — hot-lane + signal/lead workers
+# Single worker handling all queues. The --pool=solo flag is
+# required on Python 3.14 + Windows; Celery's default prefork
+# pool fails with `ValueError: not enough values to unpack` on
+# 3.14 (https://github.com/celery/celery/issues/9354 and similar).
+# On Linux you can drop --pool=solo and add --concurrency 4.
 celery -A src.tasks.celery_app worker \
-  --queues hot_lane \
-  --concurrency 2 \
-  --loglevel INFO
-
-# Terminal 2 — cold-lane + recording poller
-celery -A src.tasks.celery_app worker \
-  --queues cold_lane,recording_poll \
-  --concurrency 2 \
+  --queues hot_lane,cold_lane,recording_poll \
+  --pool=solo \
   --loglevel INFO
 ```
 
-After a worker drains the `processing_tasks` rows, verify completion:
+After ~10 seconds the LLM worker runs, fan-out enqueues `signal_jobs` and `lead_stage`, and the post-commit dispatcher picks them up:
 
 ```bash
-docker exec -it $(docker-compose ps -q postgres) \
-  psql -U postgres -d voicebot \
-  -c "SELECT step, status, attempts, actual_tokens FROM processing_tasks ORDER BY created_at DESC LIMIT 10;"
-# Expected status: 'completed' for all steps.
-
-# Verify token ledger was written for the LLM step:
-docker exec -it $(docker-compose ps -q postgres) \
-  psql -U postgres -d voicebot \
-  -c "SELECT customer_id, tokens_used, model, occurred_at FROM llm_token_ledger ORDER BY occurred_at DESC LIMIT 5;"
+docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot \
+  -c "SELECT step, lane, status, attempts, actual_tokens FROM processing_tasks WHERE interaction_id='ff000000-0000-0000-0000-000000000006' ORDER BY created_at;"
+# Expected:
+#       step      | lane |  status   | attempts | actual_tokens
+# ----------------+------+-----------+----------+---------------
+#  recording_poll | cold | scheduled |        0 |               (Exotel 401 in dev → retry path)
+#  llm_analysis   | hot  | completed |        0 |          1500
+#  signal_jobs    | hot  | completed |        0 |
+#  lead_stage     | hot  | completed |        0 |
 ```
 
-### 7. Verify backpressure endpoint
+Verify token ledger attribution and full audit trail:
 
 ```bash
-curl -s "http://localhost:8000/api/v1/dialler/backpressure?lane=hot" | python -m json.tool
-# Expected: {"throttle_factor": 1.0, "utilization_pct": <N>, ...}
+docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot \
+  -c "SELECT customer_id, tokens_used, model FROM llm_token_ledger WHERE interaction_id='ff000000-0000-0000-0000-000000000006';"
+docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot \
+  -c "SELECT step, status, attempt, occurred_at FROM interaction_audit_log WHERE interaction_id='ff000000-0000-0000-0000-000000000006' ORDER BY occurred_at;"
 ```
+
+The audit log should show the complete timeline: `enqueued` → `in_progress` → `completed` for every step, all keyed by the same `correlation_id`.
+
+### 8. Verify the backpressure endpoint
+
+```bash
+curl -s "http://localhost:8080/api/v1/dialler/backpressure?lane=hot" | python -m json.tool
+curl -s "http://localhost:8080/api/v1/dialler/backpressure?lane=cold" | python -m json.tool
+# Expected: {"throttle_factor": 1.0, "reason": "headroom_available", "utilisation": 0.0, ...}
+```
+
+### What this verification confirms
+
+Running steps 1–8 end-to-end on the actual stack (Postgres + Redis + uvicorn + Celery solo worker) on 2026-05-06 produced the expected output:
+
+- 92/92 unit tests green in 3.3s (step 2).
+- All 7 tables present with fixture customer budgets seeded (step 3).
+- `lane=hot` returned by the endpoint for the seeded rebook transcript (step 6).
+- After the worker ran: `llm_analysis` → `completed` with 1500 tokens; fan-out enqueued `signal_jobs` and `lead_stage` which both reached `completed`; `recording_poll` reached `scheduled` (the dev Exotel call returns 401, so the poller is correctly cycling through its retry schedule).
+- `llm_token_ledger` recorded one row attributed to `customer_id=d0000000-...0001`.
+- `interaction_audit_log` showed the complete timeline (enqueued → in_progress → completed for each step), all keyed by the same `correlation_id`.
+- Backpressure endpoint returned `throttle_factor=1.0, reason=headroom_available` (no load, full speed).
 
 ---
 
