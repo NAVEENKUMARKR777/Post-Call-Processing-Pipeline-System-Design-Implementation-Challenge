@@ -130,13 +130,35 @@ End-to-end flow: call ends → endpoint writes durable state + tasks → workers
 
 2. **Pre-classification at endpoint-receive time, LLM disposition at worker-completion time.** The classifier ([src/classifier/pre_classifier.py](src/classifier/pre_classifier.py)) only decides which lane to route into. The LLM still produces the authoritative `call_stage`. A misroute changes latency, never correctness. That's deliberate: the alternative (LLM-pre-classifier) cannot solve the rate-limit problem because it itself consumes LLM quota.
 
-3. **One Celery task per workflow step.** The previous monolithic `process_interaction_end_background_task` is gone. Each step (`recording_poll`, `llm_analysis`, `signal_jobs`, `lead_stage`, `crm_push`) is its own Celery task, claiming exactly one row from `processing_tasks` and committing back. Steps run independently: LLM analysis no longer waits for the recording, eliminating the 45-second sequential bottleneck.
+3. **One Celery task per workflow step, with explicit fan-out sequencing.** The previous monolithic `process_interaction_end_background_task` is gone. Each step (`recording_poll`, `llm_analysis`, `signal_jobs`, `lead_stage`, `crm_push`) is its own Celery task. The endpoint only enqueues `llm_analysis` (and `recording_poll`); `signal_jobs` and `lead_stage` are enqueued by the **LLM worker itself**, after analysis is durably committed ([src/tasks/workers/llm_worker.py](src/tasks/workers/llm_worker.py)). This eliminates the double-trigger bug from the old design (empty-payload fire at endpoint + real-payload fire from Celery) and guarantees downstream steps always receive the completed `call_stage`.
 
 4. **Two-tier rate limiter (customer + global).** Implemented as two parallel sliding-window ZSETs in Redis under a single Lua script. ALLOW iff both buckets accept. Customer-bucket isolation is what makes AC2 hold by construction.
 
 5. **Proportional backpressure replaces the binary circuit breaker.** The dialler queries the controller before each batch; the throttle factor is recomputed every read against current utilisation. A spike that drains in 30 seconds releases backpressure in 30 seconds.
 
 6. **Correlation IDs propagated via ContextVar.** Every log line, every audit row, every error path carries the same id without it being threaded through every function signature. This is what makes "debug a 3-day-old failure by interaction_id" tractable.
+
+### Step sequencing / fan-out
+
+The workflow is a two-phase DAG, not a flat list of independent tasks:
+
+```
+Endpoint
+  │
+  ├─ recording_poll (cold_lane, independent — runs in parallel with LLM)
+  │
+  └─ llm_analysis (hot/cold_lane)
+       │  [after mark_completed()]
+       ├─ signal_jobs (same lane as llm_analysis)
+       └─ lead_stage  (same lane as llm_analysis)
+                │  [after mark_completed()]
+                └─ crm_push (cold_lane)
+
+skip-lane shortcut:
+  Endpoint → lead_stage(call_stage="short_call")  [no LLM, no signal_jobs]
+```
+
+`signal_jobs` and `lead_stage` are **not** enqueued at endpoint time because their payloads include `analysis_result.call_stage`, which isn't known until the LLM finishes. The LLM worker enqueues them inside the same DB session as its own `mark_completed()` call — so the downstream rows appear atomically when the LLM result is committed. If the LLM worker crashes after `mark_completed()` but before the fan-out enqueues commit, the **entire session is rolled back**: the task reverts to `in_progress` with its stale lease and another worker reclaims it, re-runs the analysis, and re-enqueues the downstream steps — idempotently, because the UNIQUE constraint makes re-enqueue a no-op.
 
 ---
 
@@ -325,6 +347,38 @@ How that property is enforced:
 
 7. **Atomic check-and-reserve on the rate limiter** means concurrent workers cannot both see "ALLOW" under a tight limit. Failed reservations release cleanly via `BudgetManager.release()`.
 
+### Webhook idempotency
+
+Exotel can deliver the same call-end webhook twice (network retry after a timeout). The endpoint's defence is layered:
+
+1. **Status guard**: if `interactions.status` is already `ENDED`, the endpoint returns 200 immediately without re-writing tasks. Adding this guard is a one-line `WHERE status != 'ENDED'` predicate on the UPDATE; any rows not updated means the call was already processed.
+2. **UNIQUE constraint fallback**: even if two requests slip through simultaneously, the `(interaction_id, step)` UNIQUE constraint on `processing_tasks` rejects the duplicate `INSERT` — the second request's transaction is rolled back and returns 409.
+3. **Outcome**: the dialler gets a clean 200 on the duplicate and moves on; the system processes the interaction exactly once.
+
+Currently **only defence #2 is in place**; defence #1 (status guard) is listed in §15 as the next hardening step. The UNIQUE constraint is the stronger of the two — it protects even when two pods process the same webhook concurrently.
+
+### Redis failure mode
+
+The rate limiter uses Redis for sliding-window ZSETs. If Redis is unreachable, `BudgetManager.check_and_reserve()` throws a connection error.
+
+**Decision: fail open on Redis loss, with mandatory structured logging.**
+
+Rationale: the system's goal is to process calls without surfacing 429s. If Redis is down, we lose the enforcement mechanism but not the work. Calls continue to the LLM; the provider may 429 us, but the LLM worker catches that and reschedules with a calculated backoff — producing the same retry-later behaviour as a DENY from the limiter. Silent failure (fail closed = drop all calls) is worse than over-permitting during a Redis outage.
+
+Implementation: wrap `check_and_reserve` in a try/except; on `RedisError`, log at ERROR level with `redis_fallback=True` and return a synthetic ALLOW reservation with `estimated_tokens` set to the estimate. This reservation is also skipped at reconcile time (no ZSET to update). The token ledger still records actual consumption, so post-outage attribution is preserved.
+
+Sentinel thresholds: a separate health-check probe pings Redis every 10 seconds; three consecutive failures page the on-call engineer before the rate limiter is meaningfully compromised.
+
+### Graceful shutdown
+
+Workers run with `acks_late=True` in Celery, meaning the message is not acknowledged until the task function returns. This alone isn't enough for zero-downtime deploys:
+
+1. **SIGTERM → drain, not drop.** The Celery worker receives SIGTERM; it stops accepting new messages and waits up to `CELERYD_PREFETCH_MULTIPLIER × lease_seconds` (typically 30s) for in-flight tasks to complete. A task that can't finish in that window is re-queued (message nack) and its `processing_tasks` row's lease expires within 30s — another worker picks it up.
+
+2. **Lease as safety net.** If the worker is killed with SIGKILL (e.g., OOM), the in-flight row's `locked_until` expires and `expire_stale_leases()` reclaims it. This is why the 30-second lease is chosen to be longer than the worker warm-up time (~5s) but short enough to recover quickly.
+
+3. **Deployment recommendation**: rolling restart with a minimum of two workers per lane. The hot_lane must never go to zero workers; cold_lane can drain to one during a deploy window.
+
 ---
 
 ## 9. Auditability & Observability
@@ -386,6 +440,36 @@ The audit log is append-only, so even if the `processing_tasks` row was overwrit
 | Customer A exceeds reserved + burst sustained | INFO | Capacity-planning signal, not a paging event |
 
 Thresholds are tuned in code (not config) intentionally — these change after analysis, never in response to a paging incident.
+
+### Real-time metrics exposure
+
+The structured log lines are the raw feed; downstream aggregation depends on the deployment's log stack. For operators who need live dashboards without waiting for log ingestion, two Redis-backed counters supplement the audit log:
+
+| Metric | Redis key | How updated |
+|--------|-----------|-------------|
+| Current TPM (global) | `llm:tpm:global` ZSET sum | Rate-limiter Lua script on every reservation |
+| Current RPM (global) | `llm:rpm:global` ZSET cardinality | Same |
+| Per-customer TPM | `llm:tpm:cust:<cid>` ZSET sum | Same |
+| Hot queue depth | SQL: `COUNT(*) WHERE lane='hot' AND status IN ('pending','scheduled')` | Read by backpressure endpoint |
+| Cold queue depth | Same, lane='cold' | Same |
+| Dead-letter count | SQL: `COUNT(*) WHERE status='dead_letter'` | Polled by monitoring job |
+
+A `GET /api/v1/metrics/rate_limiter` endpoint (not yet implemented; listed in §15) reads these keys and returns a snapshot:
+
+```json
+{
+  "tpm_used": 67420,
+  "tpm_limit": 90000,
+  "tpm_utilization_pct": 74.9,
+  "rpm_used": 312,
+  "rpm_limit": 500,
+  "hot_queue_depth": 14,
+  "cold_queue_depth": 2031,
+  "dead_letter_count": 0
+}
+```
+
+This is the single number an on-call engineer needs to answer "is the rate limiter the bottleneck right now?" without hitting Postgres or tailing logs.
 
 ---
 
@@ -470,6 +554,28 @@ ALTER TABLE interactions
 ```
 
 The migration is idempotent (`IF NOT EXISTS` everywhere) and seeds budgets for the two fixture customers so tests are reproducible. Wired into `docker-compose.yml`'s `docker-entrypoint-initdb.d` as `02-001-migration.sql`.
+
+### Data retention and table growth
+
+At 100K calls/campaign with ~8 audit rows per interaction (enqueued, in_progress, rate_limit_deferred × N, completed × 3 steps), `interaction_audit_log` accumulates **~800K rows per campaign**. `llm_token_ledger` adds one row per LLM call. Both tables grow indefinitely without a retention policy.
+
+**Strategy: declarative partitioning by month on `occurred_at`.**
+
+```sql
+-- Drop-in replacement (requires pg 10+; migrate existing rows in background)
+CREATE TABLE interaction_audit_log (
+    ...
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+) PARTITION BY RANGE (occurred_at);
+
+CREATE TABLE interaction_audit_log_2026_05
+    PARTITION OF interaction_audit_log
+    FOR VALUES FROM ('2026-05-01') TO ('2026-06-01');
+```
+
+A monthly cron job creates the next month's partition in advance and detaches partitions older than the retention window (90 days for audit; 13 months for token ledger for billing reconciliation). Detaching, not dropping, means data is archived to cold storage (S3 as Parquet, or pg_dump) before the partition is dropped.
+
+`processing_tasks` does NOT use range partitioning — its rows are short-lived (`completed` or `dead_letter` rows are candidates for archival after 30 days). A partial index already covers the hot query path (`WHERE status IN ('pending','scheduled')`); a background cleanup job moves terminal rows to an `processing_tasks_archive` table nightly.
 
 ### What I deliberately did NOT change
 
@@ -574,6 +680,10 @@ These are gaps I would address with more time. None are blockers for the README'
 5. **No real Postgres integration tests.** The unit tests use mock `AsyncSession`; they validate worker logic but not the SQL specifics of `SELECT ... FOR UPDATE SKIP LOCKED`. The integration is verified by the smoke-test plan in §15 once docker-compose is up.
 6. **The classifier is English+Hinglish only.** Other Indian languages (Tamil, Bengali, Marathi) would mis-route. Per-customer keyword overrides are supported, but bulk-tuning is manual.
 7. **Multi-region is not addressed.** The Redis bucket is global to one region; cross-region rate limiting needs a different design (probably a shared Redis cluster with read-your-writes geography awareness, or a per-region quota with a global summary store).
+8. **Webhook idempotency guard #1 is missing.** The UNIQUE constraint on `processing_tasks` prevents double-processing (guard #2), but the endpoint doesn't check `interactions.status = 'ENDED'` before writing (guard #1). If two webhook deliveries arrive in the same millisecond, both could pass the UNIQUE check window and one will see a DB conflict. Guard #1 (a conditional UPDATE) should be added.
+9. **No `GET /api/v1/metrics/rate_limiter` endpoint.** Operators cannot see live TPM utilization without querying Redis directly. Described in §9; not implemented.
+10. **No data retention / partition management jobs.** `interaction_audit_log` and `llm_token_ledger` grow unboundedly. The partition strategy in §10 is designed but not scripted.
+11. **Graceful SIGTERM drain is not explicitly configured.** Celery's `CELERYD_MAX_TASKS_PER_CHILD` and `worker_max_tasks_per_child` settings are not set; the graceful shutdown window depends on Celery defaults (which vary by broker). A deploy without explicit drain settings risks lease orphans on every rolling restart.
 
 ---
 
@@ -583,19 +693,27 @@ Prioritised by impact:
 
 1. **Wire `expire_stale_leases()` to a Celery Beat schedule** (every 60s). Without it, a worker that crashes leaves its claimed row parked until the next manual sweep.
 
-2. **Real Postgres integration tests under docker-compose** — verify `SELECT ... FOR UPDATE SKIP LOCKED` works, the migration runs cleanly, multi-worker contention behaves as designed. The unit tests cover logic; integration covers SQL specifics.
+2. **Add webhook idempotency guard #1** — a `WHERE status != 'ENDED'` predicate on the interaction UPDATE, returning 200 early on duplicate deliveries before touching `processing_tasks`. This is a one-line change.
 
-3. **Encrypt `conversation_data` writes by default** at the endpoint and `interaction_metadata` writes at the LLM worker. The encryption helper exists; this is a one-line wrap plus a backfill job for existing rows.
+3. **Configure Celery graceful shutdown** — set `CELERYD_MAX_TASKS_PER_CHILD` and `worker_shutdown_timeout` explicitly so rolling restarts drain in-flight tasks within the 30s lease window rather than relying on Celery defaults.
 
-4. **Auth on the admin endpoint** — service-account JWT verification middleware, scoped role-checks in the budget update path.
+4. **Implement `GET /api/v1/metrics/rate_limiter`** — read the Redis ZSETs and return a live TPM/RPM snapshot for the on-call dashboard. Requires no schema change; purely a Redis read endpoint.
 
-5. **Per-step Postgres `LISTEN/NOTIFY`** to replace polling for dispatch latency. The polling design is fine at 100K rows; at 10M it becomes a bottleneck.
+5. **Real Postgres integration tests under docker-compose** — verify `SELECT ... FOR UPDATE SKIP LOCKED` works, the migration runs cleanly, multi-worker contention behaves as designed. The unit tests cover logic; integration covers SQL specifics.
 
-6. **Multi-key LLM provider support** — parameterise the rate limiter's `key_prefix` so a future "use API key X for customer A, key Y for customer B" pattern is a config change, not a redesign.
+6. **Script the partition management job** — auto-create next-month partitions for `interaction_audit_log` and `llm_token_ledger`; detach and archive partitions older than the retention window. The strategy is designed in §10; this is the operational script.
 
-7. **Token-aware estimator** — better than the current 4-chars-per-token heuristic. A small embedding-based estimator could cut the average estimation error in half, reducing the limiter's over-permissiveness margin.
+7. **Encrypt `conversation_data` writes by default** at the endpoint and `interaction_metadata` writes at the LLM worker. The encryption helper exists; this is a one-line wrap plus a backfill job for existing rows.
 
-8. **Replay UI for dead-letter rows** — the data model supports it (the row is preserved and queryable). A small admin UI that lists dead-lettered tasks and offers a one-click re-enqueue would close the operations loop.
+8. **Auth on the admin endpoint** — service-account JWT verification middleware, scoped role-checks in the budget update path.
+
+9. **Per-step Postgres `LISTEN/NOTIFY`** to replace polling for dispatch latency. The polling design is fine at 100K rows; at 10M it becomes a bottleneck.
+
+10. **Multi-key LLM provider support** — parameterise the rate limiter's `key_prefix` so a future "use API key X for customer A, key Y for customer B" pattern is a config change, not a redesign.
+
+11. **Token-aware estimator** — better than the current 4-chars-per-token heuristic. A small embedding-based estimator could cut the average estimation error in half, reducing the limiter's over-permissiveness margin.
+
+12. **Replay UI for dead-letter rows** — the data model supports it (the row is preserved and queryable). A small admin UI that lists dead-lettered tasks and offers a one-click re-enqueue would close the operations loop.
 
 9. **Recording S3 prefix per customer** + per-customer KMS key. Currently a global prefix; per-customer is one line of code plus IAM policy work.
 

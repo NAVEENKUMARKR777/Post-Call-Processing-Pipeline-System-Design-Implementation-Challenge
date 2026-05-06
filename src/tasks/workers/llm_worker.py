@@ -40,9 +40,11 @@ from src.models.processing_task import ProcessingTask
 from src.observability import bind_interaction_context, get_logger
 from src.scheduler import BudgetManager, BudgetReservation, RateLimitDecision
 from src.scheduler.task_dispatcher import (
+    enqueue_step,
     mark_completed,
     mark_for_retry,
 )
+from src.models.processing_task import TaskLane, TaskStep
 from src.services.audit_logger import record_event
 from src.services.post_call_processor import (
     AnalysisResult,
@@ -211,6 +213,33 @@ async def execute_llm_analysis(
             "drift": actual_tokens - estimated,
         },
     )
+
+    # Fan-out: enqueue downstream steps now that the analysis result is
+    # durably committed. signal_jobs and lead_stage must see the real
+    # call_stage — they can't run until this worker finishes, which is
+    # why the endpoint only enqueued llm_analysis and deferred these.
+    # The (interaction_id, step) UNIQUE constraint makes double-enqueue
+    # a safe no-op if the worker retried and this code ran before.
+    downstream_payload = {
+        **task.payload,
+        "analysis_result": {
+            "call_stage": result.call_stage,
+            "entities": result.entities or {},
+            "summary": result.summary,
+        },
+    }
+    downstream_lane = TaskLane.HOT if task.lane == TaskLane.HOT.value else TaskLane.COLD
+    for step in (TaskStep.SIGNAL_JOBS, TaskStep.LEAD_STAGE):
+        await enqueue_step(
+            session,
+            interaction_id=task.interaction_id,
+            customer_id=task.customer_id,
+            campaign_id=task.campaign_id,
+            correlation_id=task.correlation_id,
+            step=step,
+            lane=downstream_lane,
+            payload=downstream_payload,
+        )
 
     logger.info(
         "llm_analysis_complete",
