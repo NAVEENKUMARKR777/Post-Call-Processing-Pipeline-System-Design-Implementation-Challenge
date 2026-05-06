@@ -20,6 +20,18 @@ celery_app.conf.update(
     task_acks_late=True,
     worker_prefetch_multiplier=1,
     task_default_queue=settings.POSTCALL_CELERY_QUEUE,
+    # Three queues split by lane priority. Operators can give
+    # hot_lane more workers than cold_lane during peak campaign
+    # windows and thereby drain the hot lane in seconds even when
+    # cold has thousands of pending tasks.
+    task_queues=[
+        {"name": "hot_lane",        "routing_key": "hot_lane"},
+        {"name": "cold_lane",       "routing_key": "cold_lane"},
+        {"name": "recording_poll",  "routing_key": "recording_poll"},
+        # Legacy single-queue retained so existing in-flight messages
+        # can still be processed by a transitional worker.
+        {"name": settings.POSTCALL_CELERY_QUEUE, "routing_key": settings.POSTCALL_CELERY_QUEUE},
+    ],
 )
 
 
