@@ -9,3 +9,9 @@ pydantic>=2.9.0
 python-dotenv==1.0.1
 pytest==8.3.0
 pytest-asyncio==0.24.0
+# Test-only: in-memory Redis (with Lua scripting) so tests run
+# without docker-compose. Production runs against a real Redis.
+fakeredis[lua]>=2.21.0
+# Test-only: in-memory SQLite for ORM-level tests that don't need
+# Postgres-specific features (real DB tests use docker-compose).
+aiosqlite>=0.20.0
