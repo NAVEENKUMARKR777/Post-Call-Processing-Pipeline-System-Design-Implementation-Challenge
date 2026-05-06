@@ -46,6 +46,19 @@ from src.observability import bind_correlation_id, bind_interaction_context, get
 from src.scheduler import enqueue_step
 from src.utils.db import get_db
 
+# Celery task dispatchers — imported here so the endpoint can fire
+# Celery messages after the DB transaction commits. The DB row is
+# always written first (atomically with the interaction update); the
+# Celery message is a best-effort trigger. If it's lost, a periodic
+# poller (expire_stale_leases sweep) reclaims the row. Workers never
+# depend on the Celery message being delivered exactly once.
+from src.tasks.celery_tasks import (  # noqa: E402
+    dispatch_llm_analysis_cold,
+    dispatch_llm_analysis_hot,
+    dispatch_lead_stage,
+    dispatch_recording_poll,
+)
+
 logger = get_logger(__name__)
 router = APIRouter()
 
@@ -147,8 +160,9 @@ async def end_interaction(
 
     # Recording poll runs for everyone with a call_sid, regardless
     # of lane — recordings are evidence, the README is explicit.
+    rec_task = None
     if base_payload["call_sid"]:
-        await enqueue_step(
+        rec_task = await enqueue_step(
             db,
             interaction_id=interaction_id,
             customer_id=customer_id,
@@ -163,11 +177,13 @@ async def end_interaction(
             max_attempts=6,
         )
 
+    llm_task = None
+    skip_task = None
     if classification.lane is Lane.SKIP:
         # Short transcripts / wrong-number calls: AC8. No LLM call;
         # no signal_jobs (downstream systems would receive nothing
         # useful); just update the lead stage to short_call.
-        await enqueue_step(
+        skip_task = await enqueue_step(
             db,
             interaction_id=interaction_id,
             customer_id=customer_id,
@@ -185,7 +201,7 @@ async def end_interaction(
         # are enqueued by the LLM worker once analysis completes so
         # they always receive the real call_stage. This eliminates
         # the previous double-trigger bug.
-        await enqueue_step(
+        llm_task = await enqueue_step(
             db,
             interaction_id=interaction_id,
             customer_id=customer_id,
@@ -198,6 +214,17 @@ async def end_interaction(
         )
 
     await db.commit()
+
+    # Dispatch Celery messages AFTER commit so workers can find the
+    # rows by ID. If Celery is unavailable the rows stay in
+    # processing_tasks and will be drained by the poller sweep.
+    if rec_task is not None:
+        dispatch_recording_poll.delay(str(rec_task.id))
+    if llm_task is not None:
+        is_hot = classification.lane is Lane.HOT
+        (dispatch_llm_analysis_hot if is_hot else dispatch_llm_analysis_cold).delay(str(llm_task.id))
+    if skip_task is not None:
+        dispatch_lead_stage.delay(str(skip_task.id))
 
     logger.info(
         "interaction_end_enqueued",

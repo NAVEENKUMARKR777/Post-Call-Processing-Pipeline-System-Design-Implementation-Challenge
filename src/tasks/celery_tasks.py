@@ -62,20 +62,38 @@ def _get_budget_manager() -> BudgetManager:
 
 
 def _run_async(coro: Awaitable[Any]) -> Any:
-    """Run an async coroutine inside a Celery worker that wasn't
-    started with an event loop. We create one per task because
-    Celery workers fork; reusing a loop across forks is unsafe."""
+    """Run an async coroutine inside a Celery worker.
+
+    Each task gets a fresh event loop. We dispose the SQLAlchemy
+    engine's connection pool before AND after the run so asyncpg
+    connections created in a previous loop don't leak into the new
+    one. Without this, the second task in a --pool=solo worker sees
+    stale asyncpg connections tied to the first loop's I/O proactor
+    and raises 'NoneType has no attribute send'.
+    """
+    from src.utils.db import engine
+
     loop = asyncio.new_event_loop()
     try:
+        # Flush any connections bound to a previous event loop.
+        loop.run_until_complete(engine.dispose())
         return loop.run_until_complete(coro)
     finally:
+        # Return connections cleanly before closing the loop.
+        loop.run_until_complete(engine.dispose())
         loop.close()
 
 
 async def _process_one(task_id: str, executor: Callable):
     """Common per-task harness: load the row, bind context, run the
     worker, commit. Errors propagate so Celery acks_late kicks in
-    and the row's lease expires for another worker to reclaim."""
+    and the row's lease expires for another worker to reclaim.
+
+    After commit, any new downstream rows the executor wrote (the
+    LLM worker's signal_jobs/lead_stage fan-out) are dispatched as
+    fresh Celery messages. Querying after commit avoids a race where
+    the message would arrive before the row is durable.
+    """
     clear_context()
     async with async_session_factory() as session:
         stmt = select(ProcessingTask).where(ProcessingTask.id == UUID(task_id))
@@ -93,12 +111,33 @@ async def _process_one(task_id: str, executor: Callable):
             lane=task.lane,
         )
 
+        interaction_id = task.interaction_id
         try:
             await executor(session, task)
             await session.commit()
         except Exception:
             await session.rollback()
             raise
+
+    # Post-commit downstream dispatch. Fresh session avoids reading
+    # uncommitted state from the worker's session above.
+    async with async_session_factory() as session:
+        downstream_stmt = (
+            select(ProcessingTask)
+            .where(ProcessingTask.interaction_id == interaction_id)
+            .where(ProcessingTask.status == "pending")
+        )
+        downstream_rows = (await session.execute(downstream_stmt)).scalars().all()
+
+    for row in downstream_rows:
+        celery_task = _DOWNSTREAM_DISPATCH.get(row.step)
+        if celery_task is not None:
+            celery_task.delay(str(row.id))
+
+
+# Mapping from processing_task.step → Celery task that dispatches it.
+# Populated below once the @celery_app.task definitions exist.
+_DOWNSTREAM_DISPATCH: Dict[str, Any] = {}
 
 
 @celery_app.task(name="dispatch.recording_poll", queue="recording_poll", acks_late=True, max_retries=0)
@@ -135,6 +174,16 @@ def dispatch_lead_stage(task_id: str):
 @celery_app.task(name="dispatch.crm_push", queue="cold_lane", acks_late=True, max_retries=0)
 def dispatch_crm_push(task_id: str):
     _run_async(_process_one(task_id, execute_crm_push))
+
+
+# Populate the downstream-dispatch map now that the tasks exist. The
+# step strings come from src.models.processing_task.TaskStep.
+_DOWNSTREAM_DISPATCH.update({
+    "signal_jobs":   dispatch_signal_jobs,
+    "lead_stage":    dispatch_lead_stage,
+    "crm_push":      dispatch_crm_push,
+    "recording_poll": dispatch_recording_poll,
+})
 
 
 # Legacy task name kept as a tombstone import target so any in-flight

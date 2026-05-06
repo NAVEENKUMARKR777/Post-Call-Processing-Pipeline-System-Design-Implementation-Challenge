@@ -1,5 +1,6 @@
 from celery import Celery
 from celery.signals import worker_process_init
+from kombu import Queue
 
 from src.config import settings
 from src.observability import configure_structured_logging
@@ -8,6 +9,7 @@ celery_app = Celery(
     "voicebot",
     broker=settings.CELERY_BROKER_URL,
     backend=settings.CELERY_RESULT_BACKEND,
+    include=["src.tasks.celery_tasks"],
 )
 
 celery_app.conf.update(
@@ -25,12 +27,12 @@ celery_app.conf.update(
     # windows and thereby drain the hot lane in seconds even when
     # cold has thousands of pending tasks.
     task_queues=[
-        {"name": "hot_lane",        "routing_key": "hot_lane"},
-        {"name": "cold_lane",       "routing_key": "cold_lane"},
-        {"name": "recording_poll",  "routing_key": "recording_poll"},
+        Queue("hot_lane",       routing_key="hot_lane"),
+        Queue("cold_lane",      routing_key="cold_lane"),
+        Queue("recording_poll", routing_key="recording_poll"),
         # Legacy single-queue retained so existing in-flight messages
         # can still be processed by a transitional worker.
-        {"name": settings.POSTCALL_CELERY_QUEUE, "routing_key": settings.POSTCALL_CELERY_QUEUE},
+        Queue(settings.POSTCALL_CELERY_QUEUE, routing_key=settings.POSTCALL_CELERY_QUEUE),
     ],
 )
 
