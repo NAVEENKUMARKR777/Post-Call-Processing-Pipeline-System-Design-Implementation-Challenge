@@ -250,6 +250,38 @@ async def claim_due_tasks(
     return claimed
 
 
+async def mark_in_progress(
+    session: AsyncSession,
+    task: ProcessingTask,
+    *,
+    worker_name: str = "celery",
+    lease_seconds: int = DEFAULT_LEASE_SECONDS,
+) -> None:
+    """Transition a task to in_progress and emit the audit row.
+
+    Called by the Celery harness before handing off to the executor so
+    the audit trail always shows enqueued → in_progress → completed,
+    matching the polling-worker path in claim_due_tasks.
+    """
+    now = _utcnow()
+    task.status = TaskStatus.IN_PROGRESS.value
+    task.attempts = (task.attempts or 0) + 1
+    task.locked_by = worker_name
+    task.locked_until = now + timedelta(seconds=lease_seconds)
+    await session.flush()
+
+    await record_event(
+        session,
+        interaction_id=task.interaction_id,
+        customer_id=task.customer_id,
+        correlation_id=task.correlation_id,
+        step=task.step,
+        status="in_progress",
+        attempt=task.attempts,
+        detail={"locked_by": worker_name, "lease_seconds": lease_seconds},
+    )
+
+
 async def mark_completed(
     session: AsyncSession,
     task: ProcessingTask,

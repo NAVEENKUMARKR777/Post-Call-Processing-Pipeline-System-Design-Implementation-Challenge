@@ -36,6 +36,7 @@ from src.config import settings
 from src.models.processing_task import ProcessingTask, TaskStep
 from src.observability import bind_correlation_id, bind_interaction_context, clear_context
 from src.scheduler import BudgetManager, RateLimiter
+from src.scheduler.task_dispatcher import mark_in_progress
 from src.tasks.celery_app import celery_app
 from src.tasks.workers.crm_worker import execute_crm_push
 from src.tasks.workers.lead_stage_worker import execute_lead_stage
@@ -111,8 +112,16 @@ async def _process_one(task_id: str, executor: Callable):
             lane=task.lane,
         )
 
+        if task.status == "completed":
+            logger.info(
+                "task_already_completed_skip",
+                extra={"task_id": task_id, "step": task.step},
+            )
+            return
+
         interaction_id = task.interaction_id
         try:
+            await mark_in_progress(session, task, worker_name=f"celery:{task.step}")
             await executor(session, task)
             await session.commit()
         except Exception:

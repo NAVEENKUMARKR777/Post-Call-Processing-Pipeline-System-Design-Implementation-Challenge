@@ -754,7 +754,7 @@ No infrastructure needed for the unit-test suite — `fakeredis[lua]` emulates R
 ### 2. Run the full unit-test suite
 
 ```bash
-pytest tests/ -v
+python -m pytest tests/ -v
 # Expected: 92 passed
 ```
 
@@ -796,8 +796,7 @@ docker-compose up -d
 Verify the schema was applied:
 
 ```bash
-docker exec -it $(docker-compose ps -q postgres) \
-  psql -U postgres -d voicebot -c "\dt"
+docker exec -it $(docker-compose ps -q postgres) psql -U postgres -d voicebot -c "\dt"
 # Expected tables: sessions, leads, interactions, processing_tasks,
 #   customer_llm_budgets, interaction_audit_log, llm_token_ledger
 ```
@@ -805,9 +804,7 @@ docker exec -it $(docker-compose ps -q postgres) \
 Verify the migration seeded fixture customer budgets:
 
 ```bash
-docker exec -it $(docker-compose ps -q postgres) \
-  psql -U postgres -d voicebot \
-  -c "SELECT customer_id, reserved_tpm, priority FROM customer_llm_budgets;"
+docker exec -it $(docker-compose ps -q postgres) psql -U postgres -d voicebot -c "SELECT customer_id, reserved_tpm, priority FROM customer_llm_budgets;"
 ```
 
 ### 4. Seed a test lead, session, and interaction
@@ -847,16 +844,19 @@ VALUES (
 ```
 
 ```bash
-docker cp seed_smoke.sql $(docker-compose ps -q postgres):/tmp/seed_smoke.sql
-docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot -f /tmp/seed_smoke.sql
+# PowerShell:
+$container = docker-compose ps -q postgres
+docker cp seed_smoke.sql "${container}:/tmp/seed_smoke.sql"
+docker exec $container psql -U postgres -d voicebot -f /tmp/seed_smoke.sql
 ```
 
 ### 5. Start the API server
 
 ```bash
-export DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/voicebot"
-export REDIS_URL="redis://localhost:6379/0"
-uvicorn src.app:app --port 8080 --host 0.0.0.0
+# PowerShell:
+$env:DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/voicebot"
+$env:REDIS_URL="redis://localhost:6379/0"
+python -m uvicorn src.app:app --port 8080 --host 0.0.0.0
 # Note: port 8080 instead of 8000. On some Windows installations
 # port 8000 is blocked by AppContainer/HNS reservation; 8080 is
 # the next free dev port.
@@ -878,10 +878,8 @@ curl -s -X POST \
 Verify the `processing_tasks` rows and audit log:
 
 ```bash
-docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot \
-  -c "SELECT step, lane, status, next_run_at FROM processing_tasks WHERE interaction_id='ff000000-0000-0000-0000-000000000006' ORDER BY created_at;"
-docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot \
-  -c "SELECT step, status, attempt, occurred_at FROM interaction_audit_log WHERE interaction_id='ff000000-0000-0000-0000-000000000006' ORDER BY occurred_at;"
+docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot -c "SELECT step, lane, status, next_run_at FROM processing_tasks WHERE interaction_id='ff000000-0000-0000-0000-000000000006' ORDER BY created_at;"
+docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot -c "SELECT step, status, attempt, occurred_at FROM interaction_audit_log WHERE interaction_id='ff000000-0000-0000-0000-000000000006' ORDER BY occurred_at;"
 ```
 
 At this point — before any worker has run — there should be a `recording_poll` and an `llm_analysis` row, both `pending`, with two matching `enqueued` audit rows.
@@ -889,22 +887,19 @@ At this point — before any worker has run — there should be a `recording_pol
 ### 7. Start the Celery worker and observe end-to-end processing
 
 ```bash
-# Single worker handling all queues. The --pool=solo flag is
-# required on Python 3.14 + Windows; Celery's default prefork
-# pool fails with `ValueError: not enough values to unpack` on
-# 3.14 (https://github.com/celery/celery/issues/9354 and similar).
+# PowerShell:
+$env:DATABASE_URL="postgresql+asyncpg://postgres:postgres@localhost:5432/voicebot"
+$env:REDIS_URL="redis://localhost:6379/0"
+python -m celery -A src.tasks.celery_app worker --queues hot_lane,cold_lane,recording_poll --pool=solo --loglevel INFO
+# Note: --pool=solo is required on Python 3.14 + Windows; Celery's default prefork
+# pool fails with `ValueError: not enough values to unpack` on 3.14.
 # On Linux you can drop --pool=solo and add --concurrency 4.
-celery -A src.tasks.celery_app worker \
-  --queues hot_lane,cold_lane,recording_poll \
-  --pool=solo \
-  --loglevel INFO
 ```
 
 After ~10 seconds the LLM worker runs, fan-out enqueues `signal_jobs` and `lead_stage`, and the post-commit dispatcher picks them up:
 
 ```bash
-docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot \
-  -c "SELECT step, lane, status, attempts, actual_tokens FROM processing_tasks WHERE interaction_id='ff000000-0000-0000-0000-000000000006' ORDER BY created_at;"
+docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot -c "SELECT step, lane, status, attempts, actual_tokens FROM processing_tasks WHERE interaction_id='ff000000-0000-0000-0000-000000000006' ORDER BY created_at;"
 # Expected:
 #       step      | lane |  status   | attempts | actual_tokens
 # ----------------+------+-----------+----------+---------------
@@ -917,10 +912,8 @@ docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot \
 Verify token ledger attribution and full audit trail:
 
 ```bash
-docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot \
-  -c "SELECT customer_id, tokens_used, model FROM llm_token_ledger WHERE interaction_id='ff000000-0000-0000-0000-000000000006';"
-docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot \
-  -c "SELECT step, status, attempt, occurred_at FROM interaction_audit_log WHERE interaction_id='ff000000-0000-0000-0000-000000000006' ORDER BY occurred_at;"
+docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot -c "SELECT customer_id, tokens_used, model FROM llm_token_ledger WHERE interaction_id='ff000000-0000-0000-0000-000000000006';"
+docker exec $(docker-compose ps -q postgres) psql -U postgres -d voicebot -c "SELECT step, status, attempt, occurred_at FROM interaction_audit_log WHERE interaction_id='ff000000-0000-0000-0000-000000000006' ORDER BY occurred_at;"
 ```
 
 The audit log should show the complete timeline: `enqueued` → `in_progress` → `completed` for every step, all keyed by the same `correlation_id`.
